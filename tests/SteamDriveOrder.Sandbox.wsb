@@ -7,7 +7,15 @@
       <SandboxFolder>C:\SteamDriveOrder</SandboxFolder>
       <ReadOnly>true</ReadOnly>
     </MappedFolder>
+    <MappedFolder>
+      <HostFolder>C:\Users\Garrett\Projects\SteamDriveOrder\.sandbox-out</HostFolder>
+      <SandboxFolder>C:\SandboxOut</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
   </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\SteamDriveOrder\tests\Invoke-SandboxTest.ps1</Command>
+  </LogonCommand>
   <ClipboardRedirection>true</ClipboardRedirection>
   <MemoryInMB>4096</MemoryInMB>
 </Configuration>

@@ -41,6 +41,12 @@ Assert-Equal '333' $roundTrip.Libraries[1].Block['contentid'] 'contentid stays w
 Assert-Equal '200' $roundTrip.Libraries[1].Block['apps']['223850'] 'apps stay with D'
 Assert-Equal '222' $roundTrip.Libraries[2].Block['contentid'] 'contentid stays with E'
 
+$procs = Get-SteamClientProcesses
+Assert-Equal $true ($null -ne $procs.Count) 'steam process list always has Count'
+Assert-Equal $true ($procs.Count -ge 0) 'steam process count is usable'
+$summary = Get-SteamCloseProcessSummary
+Assert-Equal $true ($summary -is [string]) 'close summary is a string'
+
 Assert-Equal 'C' (Get-PathDriveLetter 'C:\Program Files (x86)\Steam') 'drive letter C'
 Assert-Equal 'D' (Get-PathDriveLetter 'D:\SteamLibrary') 'drive letter D'
 
@@ -64,14 +70,6 @@ Copy-Item -LiteralPath $samplePath -Destination (Join-Path $fakeSteam 'steamapps
 Set-Content -LiteralPath (Join-Path $fakeSteam 'steam.exe') -Value 'fake-steam' -Encoding ASCII
 
 $vdfPaths = Get-LibraryVdfPaths -SteamPath $fakeSteam
-$hashBefore = (Get-FileHash -LiteralPath $vdfPaths.Config).Hash + '|' + (Get-FileHash -LiteralPath $vdfPaths.SteamApps).Hash
-$script:DummyMode = $true
-$dummyResult = Save-LibraryOrder -SteamPath $fakeSteam -Meta $entries.Meta -Libraries $sorted
-$hashAfterDummy = (Get-FileHash -LiteralPath $vdfPaths.Config).Hash + '|' + (Get-FileHash -LiteralPath $vdfPaths.SteamApps).Hash
-Assert-Equal $true ($dummyResult -like '*dummy*') 'dummy apply reports dummy'
-Assert-Equal $hashBefore $hashAfterDummy 'dummy apply does not change fake VDF files'
-
-$script:DummyMode = $false
 $backup = Save-LibraryOrder -SteamPath $fakeSteam -Meta $entries.Meta -Libraries $sorted
 $writtenDisk = Get-LibraryEntries -Root (ConvertFrom-SteamVdf -Text ([System.IO.File]::ReadAllText($vdfPaths.Config)))
 $appsDisk = Get-LibraryEntries -Root (ConvertFrom-SteamVdf -Text ([System.IO.File]::ReadAllText($vdfPaths.SteamApps)))
@@ -84,23 +82,15 @@ $script:SteamPath = $fakeSteam
 $script:Meta = $entries.Meta
 $script:Libraries = New-Object System.Collections.Generic.List[object]
 foreach ($lib in $entries.Libraries) { $script:Libraries.Add($lib) }
-$sortFromClosure = { Invoke-SortLibrariesAz }.GetNewClosure()
-& $sortFromClosure
-Assert-Equal 'D:\SteamLibrary' $script:Libraries[1].Path 'Sort A-Z from UI closure puts D second'
-Assert-Equal 'Alphabetical' $script:UiMode 'Sort A-Z from UI closure sets mode'
+Invoke-SortLibrariesAz
+Assert-Equal 'D:\SteamLibrary' $script:Libraries[1].Path 'Sort A-Z helper puts D second'
 
 Copy-Item -LiteralPath $samplePath -Destination $vdfPaths.Config -Force
 Copy-Item -LiteralPath $samplePath -Destination $vdfPaths.SteamApps -Force
-$script:DummyMode = $true
-$applyFromClosure = { Invoke-UiApplyOrder }.GetNewClosure()
-$closureDummy = & $applyFromClosure
-Assert-Equal $true ($closureDummy -like '*dummy*') 'Test Apply from UI closure stays dummy'
-
-$script:DummyMode = $false
-$closureBackup = & $applyFromClosure
-$closureWritten = Get-LibraryEntries -Root (ConvertFrom-SteamVdf -Text ([System.IO.File]::ReadAllText($vdfPaths.Config)))
-Assert-Equal 'D:\SteamLibrary' $closureWritten.Libraries[1].Path 'Test Apply from UI closure writes sorted order'
-Assert-Equal $true (Test-Path -LiteralPath $closureBackup) 'Test Apply from UI closure still backups'
+$helperBackup = Invoke-UiApplyOrder
+$helperWritten = Get-LibraryEntries -Root (ConvertFrom-SteamVdf -Text ([System.IO.File]::ReadAllText($vdfPaths.Config)))
+Assert-Equal 'D:\SteamLibrary' $helperWritten.Libraries[1].Path 'apply helper writes sorted order'
+Assert-Equal $true (Test-Path -LiteralPath $helperBackup) 'apply helper still backups'
 
 Remove-Item -LiteralPath $fakeRoot -Recurse -Force -ErrorAction SilentlyContinue
 

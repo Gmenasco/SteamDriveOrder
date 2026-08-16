@@ -7,8 +7,6 @@ param(
     [switch]$SortDriveLetters,
     [switch]$KeepClientFirst,
     [switch]$Apply,
-    [Alias('DryRun')]
-    [switch]$Dummy,
     [switch]$SkipMain,
     [string]$SteamRoot
 )
@@ -18,25 +16,33 @@ $ErrorActionPreference = 'Stop'
 
 $script:SteamRoot = $SteamRoot
 $script:PatreonUrl = 'https://www.patreon.com/GarrettsProjects'
-$script:DummyMode = [bool]$Dummy
 $script:Drag = $null
 $script:DragFilter = $null
 $script:DragAnim = $null
 $script:CardHost = $null
 $script:Ui = $null
-$script:UiMode = $null
-$script:DummyBanner = $null
 $script:ApplyButton = $null
+$script:ForceButton = $null
+$script:SortButton = $null
+$script:FooterPanel = $null
+$script:PatreonRow = $null
+$script:ApplyPhase = 'apply'
+$script:ApplySpinTimer = $null
+$script:ApplyWatchTimer = $null
+$script:ApplyIdleTimer = $null
+$script:ApplyForceAt = $null
+$script:ForceWanted = $false
+$script:ForceSlide = 0.0
+$script:ClosingForced = $false
 $script:HintLabel = $null
-$script:KeepClientFirstUi = $null
+$script:MainForm = $null
+$script:KeepClientFirst = $true
 $script:Libraries = $null
 $script:Meta = $null
 $script:SteamPath = $null
-$script:ChosenMode = $null
-$script:ModeForm = $null
 $script:WarnBanner = $null
 $script:WarnBannerHide = $null
-$script:PickerAfterPick = $null
+$script:ShowingError = $false
 
 function Get-VdfTokens {
     param([string]$Text)
@@ -453,7 +459,65 @@ function Get-LibraryDisplayInfo {
 }
 
 function Get-SteamClientProcesses {
-    return @(Get-Process -Name steam, steamwebhelper -ErrorAction SilentlyContinue)
+    return , @(Get-Process -Name steam, steamwebhelper -ErrorAction SilentlyContinue)
+}
+
+function Get-SteamCloseProcessSummary {
+    $counts = @{}
+    $procs = Get-SteamClientProcesses
+    if ($null -eq $procs) { return '' }
+    foreach ($proc in $procs) {
+        if ($null -eq $proc) { continue }
+        $prop = $proc.PSObject.Properties['ProcessName']
+        if (-not $prop) { $prop = $proc.PSObject.Properties['Name'] }
+        if (-not $prop) { continue }
+        $name = [string]$prop.Value
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        if ($name -notmatch '(?i)\.exe$') { $name = "$name.exe" }
+        if ($counts.ContainsKey($name)) {
+            $counts[$name] += 1
+        }
+        else {
+            $counts[$name] = 1
+        }
+    }
+    if ($counts.Count -eq 0) { return '' }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($name in @($counts.Keys | Sort-Object)) {
+        $n = [int]$counts[$name]
+        if ($n -gt 1) {
+            $parts.Add("$name ($n)")
+        }
+        else {
+            $parts.Add($name)
+        }
+    }
+    return ($parts -join ', ')
+}
+
+function Update-SteamCloseHint {
+    $list = Get-SteamCloseProcessSummary
+    if ([string]::IsNullOrWhiteSpace($list)) { return }
+    if ($script:ClosingForced) {
+        Set-HintText "Forcing $list"
+    }
+    elseif ($script:ForceWanted) {
+        Set-HintText "Still waiting on $list"
+    }
+    else {
+        Set-HintText "Waiting on $list"
+    }
+}
+
+function Get-SteamMainProcesses {
+    $found = New-Object System.Collections.Generic.List[object]
+    foreach ($proc in @(Get-Process -Name steam -ErrorAction SilentlyContinue)) {
+        $path = $null
+        try { $path = $proc.Path } catch { }
+        if ($path -and ($path -notmatch '(?i)\\steam\.exe$')) { continue }
+        $found.Add($proc)
+    }
+    return , @($found.ToArray())
 }
 
 function Test-RealSteamExecutable {
@@ -506,10 +570,10 @@ function Stop-SteamClient {
     $deadline = (Get-Date).AddSeconds(45)
     do {
         Start-Sleep -Milliseconds 400
-        $left = Get-SteamClientProcesses
+        $left = Get-SteamMainProcesses
     } while ($left.Count -gt 0 -and (Get-Date) -lt $deadline)
 
-    if ((Get-SteamClientProcesses).Count -gt 0) {
+    if ((Get-SteamMainProcesses).Count -gt 0) {
         throw 'Steam did not exit. Close it from the system tray and try again.'
     }
 }
@@ -519,10 +583,6 @@ function Start-SteamClient {
     Start-Process -FilePath (Join-Path $SteamPath 'steam.exe') | Out-Null
 }
 
-function Test-DummyMode {
-    return [bool]$script:DummyMode
-}
-
 function Set-HintText {
     param([string]$Text)
     if ($script:HintLabel) {
@@ -530,22 +590,247 @@ function Set-HintText {
     }
 }
 
-function Set-UiMode {
-    param([string]$Mode)
-    $script:UiMode = $Mode
-}
-
 function Invoke-SortLibrariesAz {
     $keepPath = $null
-    if ($script:KeepClientFirstUi -and $script:KeepClientFirstUi.Checked) {
+    if ($script:KeepClientFirst) {
         $keepPath = $script:SteamPath
     }
     $script:Libraries = Sort-LibrariesByDrive -Libraries $script:Libraries -KeepFirstPath $keepPath
-    $script:UiMode = 'Alphabetical'
 }
 
 function Invoke-UiApplyOrder {
     return Save-LibraryOrder -SteamPath $script:SteamPath -Meta $script:Meta -Libraries $script:Libraries -RestartSteam
+}
+
+function Test-SteamStillRunning {
+    $procs = Get-SteamClientProcesses
+    return ($null -ne $procs -and $procs.Count -gt 0)
+}
+
+function Request-SteamShutdown {
+    param([string]$SteamPath)
+    $exe = Join-Path $SteamPath 'steam.exe'
+    if (-not (Test-Path -LiteralPath $exe)) { return }
+    if (Get-Process -Name steam -ErrorAction SilentlyContinue) {
+        Start-Process -FilePath $exe -ArgumentList '-shutdown' -WindowStyle Hidden | Out-Null
+    }
+}
+
+function Stop-ApplyWaitTimers {
+    if ($script:ApplySpinTimer) { $script:ApplySpinTimer.Stop() }
+    if ($script:ApplyWatchTimer) { $script:ApplyWatchTimer.Stop() }
+}
+
+function Stop-ApplyUiTimers {
+    Stop-ApplyWaitTimers
+    if ($script:ApplyIdleTimer) { $script:ApplyIdleTimer.Stop() }
+}
+
+function Start-ApplyIdleWatch {
+    if ($script:ApplyIdleTimer) { return }
+    $idle = New-Object System.Windows.Forms.Timer
+    $idle.Interval = 1000
+    $idle.Add_Tick({
+            if ($script:ApplyPhase -eq 'closing') { return }
+            Update-ApplyButton
+        })
+    $script:ApplyIdleTimer = $idle
+    $idle.Start()
+}
+
+function Update-ApplyButton {
+    if (-not $script:ApplyButton) { return }
+    if ($script:ApplyPhase -eq 'closing') { return }
+    if (Test-SteamStillRunning) {
+        $script:ApplyPhase = 'close'
+        $script:ApplyButton.ShowSpinner = $false
+        $script:ApplyButton.Text = 'Close Steam'
+        $script:ApplyButton.Enabled = $true
+    }
+    else {
+        $script:ApplyPhase = 'apply'
+        $script:ApplyButton.ShowSpinner = $false
+        $script:ApplyButton.Text = 'Apply to Steam'
+        $script:ApplyButton.Enabled = $true
+    }
+    $script:ApplyButton.Invalidate()
+}
+
+function Update-FooterButtons {
+    $footer = $script:FooterPanel
+    $apply = $script:ApplyButton
+    $sort = $script:SortButton
+    $force = $script:ForceButton
+    if (-not $footer -or -not $apply -or -not $sort) { return }
+    $gutter = Get-CardListGutter
+    $gap = 10
+    $apply.Top = 20
+    $sort.Top = 20
+    $apply.Left = $footer.Width - $gutter - $apply.Width
+    $slide = [double]$script:ForceSlide
+    if ($slide -lt 0) { $slide = 0 }
+    if ($slide -gt 1) { $slide = 1 }
+    $ease = 1.0 - [Math]::Pow((1.0 - $slide), 3)
+    if ($force) {
+        $force.Top = 20
+        $under = $apply.Left
+        $out = $apply.Left - $gap - $force.Width
+        $force.Left = [int][Math]::Round($under + (($out - $under) * $ease))
+        $showForce = [bool]$script:ForceWanted -or ($slide -gt 0.001)
+        $force.Visible = $showForce
+        $apply.BringToFront()
+        if ($showForce -and $slide -gt 0.001) {
+            $sort.Left = $force.Left - $gap - $sort.Width
+        }
+        else {
+            $sort.Left = $apply.Left - $gap - $sort.Width
+        }
+    }
+    else {
+        $sort.Left = $apply.Left - $gap - $sort.Width
+    }
+    $patreon = $script:PatreonRow
+    if ($patreon) {
+        $patreon.Left = $gutter
+        $patreon.Top = 21
+    }
+}
+
+function Hide-ForceButton {
+    $script:ForceWanted = $false
+    $script:ForceSlide = 0.0
+    $script:ApplyForceAt = $null
+    if ($script:ForceButton) {
+        $script:ForceButton.Visible = $false
+        $script:ForceButton.Enabled = $true
+    }
+    Update-FooterButtons
+}
+
+function Show-ForceButton {
+    if (-not $script:ForceButton) { return }
+    if ($script:ForceWanted) { return }
+    $script:ForceWanted = $true
+    $script:ForceButton.Visible = $true
+    $script:ForceButton.Enabled = $true
+    Update-SteamCloseHint
+    Update-FooterButtons
+}
+
+function Update-ApplySpinner {
+    if ($script:ApplyButton -and $script:ApplyButton.ShowSpinner) {
+        $script:ApplyButton.SpinnerAngle = ($script:ApplyButton.SpinnerAngle + 14) % 360
+        $script:ApplyButton.Invalidate()
+    }
+    if ($script:ForceWanted -and $script:ForceSlide -lt 1) {
+        $script:ForceSlide = [Math]::Min(1.0, [double]$script:ForceSlide + 0.07)
+        Update-FooterButtons
+    }
+    elseif ((-not $script:ForceWanted) -and $script:ForceSlide -gt 0) {
+        $script:ForceSlide = [Math]::Max(0.0, [double]$script:ForceSlide - 0.12)
+        Update-FooterButtons
+    }
+}
+
+function Update-ApplySteamWait {
+    if (-not (Test-SteamStillRunning)) {
+        Complete-UiSteamClosed
+        return
+    }
+    Update-SteamCloseHint
+    if ($script:ApplyForceAt -and ((Get-Date) -ge $script:ApplyForceAt)) {
+        Show-ForceButton
+    }
+}
+
+function Complete-UiSteamClosed {
+    Stop-ApplyWaitTimers
+    $script:ClosingForced = $false
+    Hide-ForceButton
+    $script:ApplyPhase = 'apply'
+    Update-ApplyButton
+    Set-HintText 'Steam is closed. Apply when you are ready.'
+    Update-FooterButtons
+}
+
+function Invoke-ForceSteamClose {
+    $script:ClosingForced = $true
+    Update-SteamCloseHint
+    if ($script:ForceButton) { $script:ForceButton.Enabled = $false }
+    Get-Process -Name steam, steamwebhelper -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Start-UiSteamClose {
+    if (-not (Test-SteamStillRunning)) {
+        Complete-UiSteamClosed
+        return
+    }
+    if (Test-SteamGameRunning) {
+        [void](Show-SteamPrompt -Title 'Could not close Steam' -Body 'A Steam game is running. Exit the game first, then try again.' -Kind Error -Owner $script:MainForm)
+        return
+    }
+    $script:ApplyPhase = 'closing'
+    $script:ClosingForced = $false
+    $script:ForceWanted = $false
+    $script:ForceSlide = 0.0
+    $script:ApplyForceAt = (Get-Date).AddSeconds(10)
+    if ($script:ForceButton) {
+        $script:ForceButton.Visible = $false
+        $script:ForceButton.Enabled = $true
+    }
+    $script:ApplyButton.Text = ''
+    $script:ApplyButton.ShowSpinner = $true
+    $script:ApplyButton.Enabled = $false
+    $script:ApplyButton.Invalidate()
+    Update-SteamCloseHint
+    Request-SteamShutdown -SteamPath $script:SteamPath
+    if (-not $script:ApplySpinTimer) {
+        $spin = New-Object System.Windows.Forms.Timer
+        $spin.Interval = 30
+        $spin.Add_Tick({ Update-ApplySpinner })
+        $script:ApplySpinTimer = $spin
+    }
+    if (-not $script:ApplyWatchTimer) {
+        $watch = New-Object System.Windows.Forms.Timer
+        $watch.Interval = 250
+        $watch.Add_Tick({ Update-ApplySteamWait })
+        $script:ApplyWatchTimer = $watch
+    }
+    $script:ApplySpinTimer.Start()
+    $script:ApplyWatchTimer.Start()
+}
+
+function Invoke-UiApplyConfirm {
+    $prompt = "Both libraryfolders.vdf files will be updated.`nSteam will then reopen so the new Install to order is used.`nA backup is created first."
+    $answer = Show-SteamPrompt -Title 'Apply library order' -Body $prompt -Kind Question -Owner $script:MainForm
+    if ($answer -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    try {
+        $backup = Invoke-UiApplyOrder
+        Set-HintText "Saved. Steam is restarting. Backup: $backup"
+        [void](Show-SteamPrompt -Title 'SteamDriveOrder' -Body "Library order saved.`n`nSteam is restarting so the new order is used.`n`nBackup:`n$backup" -Kind Info -Owner $script:MainForm)
+        if ($script:MainForm -and -not $script:MainForm.IsDisposed) {
+            $script:MainForm.Close()
+        }
+    }
+    catch {
+        [void](Show-SteamPrompt -Title 'Could not apply order' -Body $_.Exception.Message -Kind Error -Owner $script:MainForm)
+        Update-ApplyButton
+    }
+}
+
+function Invoke-ApplyButtonClick {
+    try {
+        if ($script:ApplyPhase -eq 'close') {
+            Start-UiSteamClose
+            return
+        }
+        Invoke-UiApplyConfirm
+    }
+    catch {
+        Restore-UiAfterDialog -Owner $script:MainForm
+        [void](Show-SteamPrompt -Title 'Could not apply order' -Body $_.Exception.Message -Kind Error -Owner $script:MainForm)
+        Update-ApplyButton
+    }
 }
 
 function Save-LibraryOrder {
@@ -568,10 +853,6 @@ function Save-LibraryOrder {
         if ($expected[$i] -ine $actual[$i]) {
             throw "Write verification failed at index $i."
         }
-    }
-
-    if (Test-DummyMode) {
-        return '(dummy) no files written, Steam left running'
     }
 
     $realClient = Test-RealSteamExecutable -SteamPath $SteamPath
@@ -631,12 +912,7 @@ function Invoke-CliApply {
         $libs = Sort-LibrariesByDrive -Libraries $libs -KeepFirstPath $keep
     }
     $backup = Save-LibraryOrder -SteamPath $steam -Meta $state.Meta -Libraries $libs -RestartSteam
-    if (Test-DummyMode) {
-        Write-Host "DUMMY MODE: no files written, Steam was not closed."
-    }
-    else {
-        Write-Host "Updated both libraryfolders.vdf files."
-    }
+    Write-Host "Updated both libraryfolders.vdf files."
     Write-Host "Backup: $backup"
     Write-Host "New order:"
     $i = 1
@@ -647,7 +923,48 @@ function Invoke-CliApply {
     }
 }
 
+function Hide-HostConsole {
+    if (-not ('SteamDriveOrderNative' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class SteamDriveOrderNative {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public static void HideConsole() {
+        IntPtr hwnd = GetConsoleWindow();
+        if (hwnd != IntPtr.Zero) ShowWindow(hwnd, 0);
+    }
+}
+"@
+    }
+    [SteamDriveOrderNative]::HideConsole()
+}
+
+function Get-UiTheme {
+    return @{
+        Bg         = [System.Drawing.Color]::FromArgb(27, 32, 40)
+        Surface    = [System.Drawing.Color]::FromArgb(23, 26, 33)
+        Card       = [System.Drawing.Color]::FromArgb(45, 50, 58)
+        CardHot    = [System.Drawing.Color]::FromArgb(61, 68, 80)
+        Line       = [System.Drawing.Color]::FromArgb(45, 50, 58)
+        Text       = [System.Drawing.Color]::FromArgb(220, 222, 223)
+        Muted      = [System.Drawing.Color]::FromArgb(139, 148, 158)
+        Accent     = [System.Drawing.Color]::FromArgb(26, 159, 255)
+        AccentSoft = [System.Drawing.Color]::FromArgb(102, 192, 244)
+        Accent2    = [System.Drawing.Color]::FromArgb(199, 128, 22)
+        Good       = [System.Drawing.Color]::FromArgb(89, 191, 64)
+        GoodText   = [System.Drawing.Color]::FromArgb(255, 255, 255)
+        Button     = [System.Drawing.Color]::FromArgb(61, 68, 80)
+        ButtonHot  = [System.Drawing.Color]::FromArgb(75, 84, 99)
+        BarBack    = [System.Drawing.Color]::FromArgb(35, 41, 50)
+        Title      = [System.Drawing.Color]::FromArgb(23, 26, 33)
+        Dialog     = [System.Drawing.Color]::FromArgb(24, 27, 34)
+    }
+}
+
 function Initialize-SteamDriveOrderUi {
+    Hide-HostConsole
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     try {
@@ -668,24 +985,7 @@ public static class SteamDriveOrderDpi {
     [System.Windows.Forms.Application]::EnableVisualStyles()
     Enable-UiErrorHandler
 
-    $script:Ui = @{
-        Bg        = [System.Drawing.Color]::FromArgb(14, 20, 27)
-        Surface   = [System.Drawing.Color]::FromArgb(23, 26, 33)
-        Card      = [System.Drawing.Color]::FromArgb(27, 40, 56)
-        CardHot   = [System.Drawing.Color]::FromArgb(35, 52, 72)
-        Line      = [System.Drawing.Color]::FromArgb(42, 71, 94)
-        Text      = [System.Drawing.Color]::FromArgb(220, 222, 223)
-        Muted     = [System.Drawing.Color]::FromArgb(143, 152, 160)
-        Accent    = [System.Drawing.Color]::FromArgb(26, 159, 255)
-        AccentSoft= [System.Drawing.Color]::FromArgb(102, 192, 244)
-        Accent2   = [System.Drawing.Color]::FromArgb(199, 128, 22)
-        Good      = [System.Drawing.Color]::FromArgb(89, 191, 64)
-        GoodText  = [System.Drawing.Color]::FromArgb(255, 255, 255)
-        Button    = [System.Drawing.Color]::FromArgb(61, 68, 80)
-        ButtonHot = [System.Drawing.Color]::FromArgb(75, 84, 99)
-        BarBack   = [System.Drawing.Color]::FromArgb(35, 41, 50)
-        Title     = [System.Drawing.Color]::FromArgb(23, 26, 33)
-    }
+    $script:Ui = Get-UiTheme
     $script:Drag = New-CardDragState
 
     if (-not ('SteamChrome' -as [type])) {
@@ -725,10 +1025,21 @@ public static class SteamChrome {
 }
 
 public class SteamForm : Form {
+    bool _shown;
     public SteamForm() {
-        BackColor = Color.FromArgb(14, 20, 27);
+        BackColor = Color.FromArgb(27, 32, 40);
         ForeColor = Color.FromArgb(220, 222, 223);
         DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
+        UpdateStyles();
+        Opacity = 0d;
+    }
+    protected override CreateParams CreateParams {
+        get {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= 0x02000000;
+            return cp;
+        }
     }
     protected override void WndProc(ref Message m) {
         if (m.Msg == 0x0014) {
@@ -736,6 +1047,22 @@ public class SteamForm : Form {
             return;
         }
         base.WndProc(ref m);
+    }
+    protected override void OnPaintBackground(PaintEventArgs e) {
+        using (SolidBrush br = new SolidBrush(BackColor))
+            e.Graphics.FillRectangle(br, ClientRectangle);
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        using (SolidBrush br = new SolidBrush(BackColor))
+            e.Graphics.FillRectangle(br, ClientRectangle);
+    }
+    protected override void OnShown(EventArgs e) {
+        if (!_shown) {
+            _shown = true;
+            Opacity = 1d;
+            Update();
+        }
+        base.OnShown(e);
     }
 }
 
@@ -761,8 +1088,11 @@ public class SteamUsageBar : Control {
 
 public class SteamButton : Button {
     public bool IsPrimary;
+    public bool IsDanger;
+    public bool ShowSpinner;
+    public float SpinnerAngle;
     public int Arrow;
-    Color _clear = Color.FromArgb(27, 40, 56);
+    Color _clear = Color.FromArgb(27, 32, 40);
     public Color ClearColor {
         get { return _clear; }
         set {
@@ -798,11 +1128,14 @@ public class SteamButton : Button {
             g.FillRectangle(clear, ClientRectangle);
         RectangleF r = new RectangleF(1.25f, 1.25f, Math.Max(1f, Width - 2.5f), Math.Max(1f, Height - 2.5f));
         bool hot = ClientRectangle.Contains(PointToClient(Control.MousePosition));
-        using (GraphicsPath path = SteamChrome.RoundRectF(r, 5f)) {
-            if (IsPrimary) {
-                Color a = hot ? Color.FromArgb(40, 200, 255) : Color.FromArgb(6, 191, 255);
-                Color b = hot ? Color.FromArgb(70, 140, 255) : Color.FromArgb(45, 115, 255);
-                using (LinearGradientBrush br = new LinearGradientBrush(Rectangle.Round(r), a, b, LinearGradientMode.Horizontal))
+        using (GraphicsPath path = SteamChrome.RoundRectF(r, 3f)) {
+            if (IsDanger) {
+                Color c = hot ? Color.FromArgb(232, 88, 88) : Color.FromArgb(196, 54, 54);
+                using (SolidBrush br = new SolidBrush(c))
+                    g.FillPath(br, path);
+            } else if (IsPrimary) {
+                Color c = hot ? Color.FromArgb(64, 176, 255) : Color.FromArgb(26, 159, 255);
+                using (SolidBrush br = new SolidBrush(c))
                     g.FillPath(br, path);
             } else {
                 Color c = hot ? Color.FromArgb(75, 84, 99) : Color.FromArgb(61, 68, 80);
@@ -810,7 +1143,21 @@ public class SteamButton : Button {
                     g.FillPath(br, path);
             }
         }
-        if (Arrow != 0) {
+        if (ShowSpinner) {
+            float s = Math.Min(Width, Height) * 0.42f;
+            float cx = Width / 2f;
+            float cy = Height / 2f;
+            RectangleF ring = new RectangleF(cx - s / 2f, cy - s / 2f, s, s);
+            using (Pen dim = new Pen(Color.FromArgb(70, 255, 255, 255), 2.3f))
+            using (Pen arc = new Pen(Color.White, 2.3f)) {
+                dim.StartCap = LineCap.Round;
+                dim.EndCap = LineCap.Round;
+                arc.StartCap = LineCap.Round;
+                arc.EndCap = LineCap.Round;
+                g.DrawArc(dim, ring, 0f, 360f);
+                g.DrawArc(arc, ring, SpinnerAngle, 78f);
+            }
+        } else if (Arrow != 0) {
             float cx = Width / 2f;
             float cy = Height / 2f;
             PointF[] pts = Arrow > 0
@@ -832,9 +1179,9 @@ public class SteamButton : Button {
 }
 
 public class SteamCard : Panel {
-    public Color ClearColor = Color.FromArgb(14, 20, 27);
+    public Color ClearColor = Color.FromArgb(27, 32, 40);
     public Color TopAccent = Color.Empty;
-    public int CornerRadius = 6;
+    public int CornerRadius = 3;
     public bool Placeholder;
     public SteamCard() {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -874,76 +1221,8 @@ public class SteamCard : Panel {
     }
 }
 
-public class SteamBadge : Control {
-    public Color Accent = Color.FromArgb(102, 192, 244);
-    public Color Fill = Color.FromArgb(16, 38, 54);
-    public Color ClearColor = Color.FromArgb(23, 26, 33);
-    public bool ShowPip = true;
-    public SteamBadge() {
-        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-        Height = 22;
-        ForeColor = Color.FromArgb(102, 192, 244);
-        Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
-    }
-    protected override void OnPaintBackground(PaintEventArgs e) {
-        using (SolidBrush clear = new SolidBrush(ClearColor))
-            e.Graphics.FillRectangle(clear, ClientRectangle);
-    }
-    protected override void OnPaint(PaintEventArgs e) {
-        Graphics g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        g.CompositingQuality = CompositingQuality.HighQuality;
-        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-        using (SolidBrush clear = new SolidBrush(ClearColor))
-            g.FillRectangle(clear, ClientRectangle);
-        RectangleF glow = new RectangleF(0.4f, 0.4f, Width - 1.2f, Height - 1.2f);
-        using (GraphicsPath glowPath = SteamChrome.RoundRectF(glow, glow.Height / 2f))
-        using (SolidBrush gb = new SolidBrush(Color.FromArgb(40, Accent)))
-            g.FillPath(gb, glowPath);
-        RectangleF body = new RectangleF(1.4f, 1.4f, Width - 3.2f, Height - 3.2f);
-        Color fillBottom = Color.FromArgb(Fill.A, Math.Max(0, Fill.R - 10), Math.Max(0, Fill.G - 8), Math.Max(0, Fill.B - 6));
-        using (GraphicsPath path = SteamChrome.RoundRectF(body, body.Height / 2f)) {
-            using (LinearGradientBrush br = new LinearGradientBrush(body, Fill, fillBottom, LinearGradientMode.Vertical))
-                g.FillPath(br, path);
-            using (Pen pen = new Pen(Color.FromArgb(200, Accent), 1f))
-                g.DrawPath(pen, path);
-        }
-        int textLeft = 9;
-        if (ShowPip) {
-            float pip = 5.5f;
-            float px = 9f;
-            float py = (Height - pip) / 2f;
-            using (SolidBrush pipGlow = new SolidBrush(Color.FromArgb(70, Accent)))
-                g.FillEllipse(pipGlow, px - 1.4f, py - 1.4f, pip + 2.8f, pip + 2.8f);
-            using (SolidBrush pipBrush = new SolidBrush(Accent))
-                g.FillEllipse(pipBrush, px, py, pip, pip);
-            using (SolidBrush shine = new SolidBrush(Color.FromArgb(110, Color.White)))
-                g.FillEllipse(shine, px + 1.1f, py + 0.9f, 2.2f, 2.2f);
-            textLeft = 19;
-        }
-        DrawTracked(g, Text, Font, ForeColor, new Rectangle(textLeft, 0, Math.Max(8, Width - textLeft - 8), Height));
-    }
-    static void DrawTracked(Graphics g, string text, Font font, Color color, Rectangle bounds) {
-        if (string.IsNullOrEmpty(text)) return;
-        TextFormatFlags flags = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter | TextFormatFlags.Left;
-        int track = 2;
-        int total = 0;
-        Size[] sizes = new Size[text.Length];
-        for (int i = 0; i < text.Length; i++) {
-            sizes[i] = TextRenderer.MeasureText(g, text.Substring(i, 1), font, new Size(int.MaxValue, int.MaxValue), flags);
-            total += sizes[i].Width;
-            if (i > 0) total += track;
-        }
-        int x = bounds.X;
-        for (int i = 0; i < text.Length; i++) {
-            TextRenderer.DrawText(g, text.Substring(i, 1), font, new Rectangle(x, bounds.Y, sizes[i].Width + 6, bounds.Height), color, flags);
-            x += sizes[i].Width + track;
-        }
-    }
-}
-
 public class SteamText : Label {
+    public bool Wrap;
     public SteamText() {
         AutoSize = false;
         UseMnemonic = false;
@@ -956,8 +1235,10 @@ public class SteamText : Label {
         using (SolidBrush b = new SolidBrush(BackColor))
             e.Graphics.FillRectangle(b, ClientRectangle);
         if (string.IsNullOrEmpty(Text)) return;
-        TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor,
-            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        TextFormatFlags flags = TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.GlyphOverhangPadding;
+        if (Wrap) flags |= TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl;
+        else flags |= TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis;
+        TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor, flags);
     }
 }
 
@@ -996,7 +1277,7 @@ public class SteamGhost : Form {
         StartPosition = FormStartPosition.Manual;
         TopMost = true;
         Opacity = 0.58;
-        BackColor = Color.FromArgb(14, 20, 27);
+        BackColor = Color.FromArgb(27, 32, 40);
         ShowIcon = false;
         ControlBox = false;
     }
@@ -1015,7 +1296,7 @@ public class SteamGhost : Form {
     protected override void OnPaint(PaintEventArgs e) {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.Clear(Color.FromArgb(14, 20, 27));
+        g.Clear(Color.FromArgb(27, 32, 40));
         if (Frame != null)
             g.DrawImage(Frame, 0, 0, Width, Height);
         using (GraphicsPath path = SteamChrome.RoundRectF(new RectangleF(0.5f, 0.5f, Math.Max(1f, Width - 1.5f), Math.Max(1f, Height - 1.5f)), 6f))
@@ -1054,42 +1335,30 @@ public class SteamDragFilter : IMessageFilter {
     }
 }
 
-public class SteamToggle : Control {
-    bool _checked;
-    public Color ClearColor = Color.FromArgb(14, 20, 27);
-    public bool Checked {
-        get { return _checked; }
-        set { if (_checked != value) { _checked = value; Invalidate(); } }
+public class SteamPromptMark : Control {
+    public Color Accent = Color.FromArgb(26, 159, 255);
+    public string Glyph = "!";
+    public SteamPromptMark() {
+        Size = new Size(36, 36);
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
     }
-    public event EventHandler CheckedChanged;
-    public SteamToggle() {
-        Size = new Size(42, 22);
-        Cursor = Cursors.Hand;
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-    }
-    protected override void OnClick(EventArgs e) {
-        Checked = !Checked;
-        EventHandler h = CheckedChanged;
-        if (h != null) h(this, EventArgs.Empty);
-        base.OnClick(e);
-    }
+    protected override void OnPaintBackground(PaintEventArgs e) { }
     protected override void OnPaint(PaintEventArgs e) {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        using (SolidBrush clear = new SolidBrush(ClearColor))
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+        using (SolidBrush clear = new SolidBrush(BackColor))
             g.FillRectangle(clear, ClientRectangle);
-        RectangleF track = new RectangleF(1f, 2.5f, Width - 2f, Height - 5f);
-        Color fill = _checked ? Color.FromArgb(26, 159, 255) : Color.FromArgb(61, 68, 80);
-        using (GraphicsPath path = SteamChrome.RoundRectF(track, track.Height / 2f))
-        using (SolidBrush br = new SolidBrush(fill))
-            g.FillPath(br, path);
-        float pad = 2.2f;
-        float knob = track.Height - (pad * 2f);
-        float x = _checked ? track.Right - pad - knob : track.X + pad;
-        float y = track.Y + pad;
-        using (SolidBrush br = new SolidBrush(Color.White))
-            g.FillEllipse(br, x, y, knob, knob);
+        RectangleF ring = new RectangleF(2.25f, 2.25f, Width - 5.5f, Height - 5.5f);
+        using (SolidBrush fill = new SolidBrush(Color.FromArgb(28, Accent)))
+            g.FillEllipse(fill, ring);
+        using (Pen pen = new Pen(Color.FromArgb(180, Accent), 1.4f))
+            g.DrawEllipse(pen, ring);
+        Font font = new Font("Segoe UI", Math.Max(10f, Width * 0.34f), FontStyle.Bold);
+        TextRenderer.DrawText(g, Glyph, font, ClientRectangle, Color.FromArgb(230, 236, 242),
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        font.Dispose();
     }
 }
 
@@ -1109,9 +1378,9 @@ public class SteamScrollView : Panel, IMessageFilter {
         AutoScroll = false;
         DoubleBuffered = true;
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-        BackColor = Color.FromArgb(14, 20, 27);
+        BackColor = Color.FromArgb(27, 32, 40);
         _content = new Panel();
-        _content.BackColor = Color.FromArgb(14, 20, 27);
+        _content.BackColor = Color.FromArgb(27, 32, 40);
         _content.Location = Point.Empty;
         Controls.Add(_content);
         _anim = new Timer();
@@ -1245,6 +1514,238 @@ function Set-ControlBackColor {
     }
 }
 
+function Get-UiTextWidth {
+    param([string]$Text, $Font)
+    if ([string]::IsNullOrEmpty($Text) -or -not $Font) { return 0 }
+    $size = New-Object System.Drawing.Size
+    $size.Width = 0
+    $size.Height = 0
+    return [System.Windows.Forms.TextRenderer]::MeasureText(
+        $Text,
+        $Font,
+        $size,
+        [System.Windows.Forms.TextFormatFlags]::NoPrefix
+    ).Width
+}
+
+function Format-PromptWrappedText {
+    param(
+        [string]$Text,
+        [int]$MaxWidth,
+        $Font
+    )
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($raw in ($Text -split "`n", -1)) {
+        if ($raw.Length -eq 0) {
+            $lines.Add('')
+            continue
+        }
+        if ((Get-UiTextWidth -Text $raw -Font $Font) -le $MaxWidth) {
+            $lines.Add($raw)
+            continue
+        }
+        $parts = [regex]::Split($raw, '(?<=[\\/])')
+        $current = ''
+        foreach ($part in $parts) {
+            if ($part.Length -eq 0) { continue }
+            $try = $current + $part
+            if ($current.Length -gt 0 -and (Get-UiTextWidth -Text $try -Font $Font) -gt $MaxWidth) {
+                $lines.Add($current)
+                $current = $part
+            }
+            else {
+                $current = $try
+            }
+        }
+        if ($current.Length -gt 0) { $lines.Add($current) }
+    }
+    return ($lines -join "`n")
+}
+
+function Show-SteamPrompt {
+    param(
+        [string]$Title,
+        [string]$Body,
+        [ValidateSet('Question', 'Error', 'Info')]
+        [string]$Kind = 'Info',
+        $Owner = $null
+    )
+
+    $ui = Get-UiTheme
+    $chrome = $ui.Dialog
+    $box = $ui.Card
+    $headingText = if ([string]::IsNullOrWhiteSpace($Title)) { 'SteamDriveOrder' } else { $Title }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $headingText
+    $form.FormBorderStyle = 'None'
+    $form.StartPosition = $(if ($Owner -and -not $Owner.IsDisposed) { 'CenterParent' } else { 'CenterScreen' })
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ControlBox = $false
+    $form.ShowInTaskbar = $false
+    $form.ShowIcon = $false
+    $form.BackColor = $chrome
+    $form.ForeColor = $ui.Text
+    $form.Font = New-UiFont
+    $form.ClientSize = New-Object System.Drawing.Size -ArgumentList 480, 200
+    Enable-DoubleBuffer -Control $form
+
+    $card = New-Object SteamCard
+    $card.BackColor = $box
+    $card.ClearColor = $chrome
+    $card.CornerRadius = 3
+
+    $heading = New-UiLabel -Text $headingText -Size 12.5 -Style Bold -Fore $ui.Text -Flush
+    $heading.BackColor = $box
+    $heading.SetBounds(16, 14, 400, 26)
+
+    $label = New-UiLabel -Text $Body -Size 10 -Fore $ui.Text -Flush
+    $label.Wrap = $true
+    $label.BackColor = $box
+    $label.SetBounds(16, 44, 400, 80)
+    $card.Controls.Add($label)
+    $card.Controls.Add($heading)
+
+    $minTextW = 400
+    $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    if ($Owner -and -not $Owner.IsDisposed) {
+        $area = [System.Windows.Forms.Screen]::FromControl($Owner).WorkingArea
+    }
+    $maxTextW = [Math]::Max($minTextW, $area.Width - 200)
+    $neededTextW = $minTextW
+    foreach ($line in ($Body -split "`n", -1)) {
+        if ($line.Length -eq 0) { continue }
+        $lineW = Get-UiTextWidth -Text $line -Font $label.Font
+        if ($lineW -gt $neededTextW) { $neededTextW = $lineW }
+    }
+    if ($neededTextW -gt $maxTextW) { $neededTextW = $maxTextW }
+    $displayBody = Format-PromptWrappedText -Text $Body -MaxWidth $neededTextW -Font $label.Font
+    $label.Text = $displayBody
+
+    $okText = if ($Kind -eq 'Question') { 'Continue' } else { 'OK' }
+    $ok = New-UiButton -Text $okText -Width 120 -Height 36 -Primary
+    $ok.ClearColor = $chrome
+    $ok.Add_Click({
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $form.Close()
+        }.GetNewClosure())
+
+    $buttons = New-Object System.Collections.Generic.List[object]
+    if ($Kind -eq 'Question') {
+        $cancel = New-UiButton -Text 'Cancel' -Width 110 -Height 36
+        $cancel.ClearColor = $chrome
+        $cancel.Add_Click({
+                $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+                $form.Close()
+            }.GetNewClosure())
+        $buttons.Add($cancel)
+        $form.Controls.Add($cancel)
+        $form.CancelButton = $cancel
+    }
+    $buttons.Add($ok)
+    $form.Controls.Add($ok)
+    $form.AcceptButton = $ok
+
+    $place = {
+        $pad = 20
+        $card.Left = $pad
+        $card.Top = $pad
+        $card.Width = $form.ClientSize.Width - ($pad * 2)
+        $textW = [Math]::Max(120, $card.Width - 32)
+        $heading.Width = $textW
+        $label.Width = $textW
+        $x = $form.ClientSize.Width - $pad
+        $y = $form.ClientSize.Height - $pad - 36
+        for ($i = $buttons.Count - 1; $i -ge 0; $i--) {
+            $b = $buttons[$i]
+            $x -= $b.Width
+            $b.Left = $x
+            $b.Top = $y
+            $x -= 8
+        }
+    }.GetNewClosure()
+
+    $form.Controls.Add($card)
+    $form.Add_Paint({
+            param($sender, $event)
+            $pen = New-Object System.Drawing.Pen $ui.CardHot, 1
+            $event.Graphics.DrawRectangle($pen, 0, 0, ($sender.ClientSize.Width - 1), ($sender.ClientSize.Height - 1))
+            $pen.Dispose()
+        }.GetNewClosure())
+
+    $drag = @{ Active = $false; X = 0; Y = 0 }
+    $startDrag = {
+        param($sender, $event)
+        if ($event.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        $cursor = [System.Windows.Forms.Cursor]::Position
+        $drag.Active = $true
+        $drag.X = $cursor.X - $form.Left
+        $drag.Y = $cursor.Y - $form.Top
+    }.GetNewClosure()
+    $moveDrag = {
+        param($sender, $event)
+        if (-not $drag.Active) { return }
+        $cursor = [System.Windows.Forms.Cursor]::Position
+        $form.Left = $cursor.X - $drag.X
+        $form.Top = $cursor.Y - $drag.Y
+    }.GetNewClosure()
+    $endDrag = { $drag.Active = $false }
+    foreach ($dragTarget in @($form, $card, $heading, $label)) {
+        $dragTarget.Add_MouseDown($startDrag)
+        $dragTarget.Add_MouseMove($moveDrag)
+        $dragTarget.Add_MouseUp($endDrag)
+    }
+
+    $measureSize = New-Object System.Drawing.Size
+    $measureSize.Width = $neededTextW
+    $measureSize.Height = 0
+    $needed = [System.Windows.Forms.TextRenderer]::MeasureText(
+        $displayBody,
+        $label.Font,
+        $measureSize,
+        [System.Windows.Forms.TextFormatFlags]::WordBreak
+    ).Height
+    $label.Height = [Math]::Max(40, ($needed + 8))
+    $card.Height = $label.Bottom + 16
+    $formSize = New-Object System.Drawing.Size
+    $formSize.Width = $neededTextW + 72
+    $formSize.Height = [int]($card.Bottom + 36 + 36 + 24)
+    $form.ClientSize = $formSize
+    & $place
+
+    $ownerForm = $null
+    if ($Owner -and -not $Owner.IsDisposed) { $ownerForm = $Owner }
+    try {
+        if ($ownerForm) {
+            return $form.ShowDialog($ownerForm)
+        }
+        return $form.ShowDialog()
+    }
+    catch {
+        return [System.Windows.Forms.DialogResult]::Cancel
+    }
+    finally {
+        Restore-UiAfterDialog -Owner $ownerForm
+        if ($form -and -not $form.IsDisposed) {
+            $form.Dispose()
+        }
+    }
+}
+
+function Restore-UiAfterDialog {
+    param($Owner = $null)
+    $forms = New-Object System.Collections.Generic.List[object]
+    if ($Owner) { $forms.Add($Owner) }
+    if ($script:MainForm) { $forms.Add($script:MainForm) }
+    foreach ($f in $forms) {
+        if ($f -and -not $f.IsDisposed) {
+            $f.Enabled = $true
+        }
+    }
+}
+
 function Show-SteamErrorDialog {
     param($ErrorObject)
     $details = ''
@@ -1258,19 +1759,21 @@ function Show-SteamErrorDialog {
         $details = [string]$ErrorObject
     }
 
+    $ui = Get-UiTheme
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'SteamDriveOrder error'
     $form.StartPosition = 'CenterScreen'
     $form.Size = New-Object System.Drawing.Size(860, 560)
     $form.MinimumSize = New-Object System.Drawing.Size(640, 400)
-    $form.BackColor = [System.Drawing.Color]::FromArgb(14, 20, 27)
-    $form.ForeColor = [System.Drawing.Color]::FromArgb(220, 222, 223)
+    $form.BackColor = $ui.Bg
+    $form.ForeColor = $ui.Text
     $form.ShowIcon = $false
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = 'Something went wrong'
     $title.Font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
-    $title.ForeColor = [System.Drawing.Color]::White
+    $title.ForeColor = $ui.Text
+    $title.BackColor = $ui.Bg
     $title.Dock = 'Top'
     $title.Height = 40
     $title.Padding = New-Object System.Windows.Forms.Padding(16, 10, 16, 0)
@@ -1282,29 +1785,61 @@ function Show-SteamErrorDialog {
     $box.WordWrap = $true
     $box.Dock = 'Fill'
     $box.Font = New-Object System.Drawing.Font('Consolas', 10)
-    $box.BackColor = [System.Drawing.Color]::FromArgb(23, 26, 33)
-    $box.ForeColor = [System.Drawing.Color]::FromArgb(220, 222, 223)
+    $box.BackColor = $ui.Card
+    $box.ForeColor = $ui.Text
     $box.Text = $details
 
     $ok = New-Object System.Windows.Forms.Button
     $ok.Text = 'Close'
     $ok.Dock = 'Bottom'
     $ok.Height = 40
+    $ok.FlatStyle = 'Flat'
+    $ok.BackColor = $ui.Button
+    $ok.ForeColor = $ui.Text
+    $ok.FlatAppearance.BorderSize = 0
     $ok.Add_Click({ $form.Close() })
 
     $form.Controls.Add($box)
     $form.Controls.Add($ok)
     $form.Controls.Add($title)
-    [void]$form.ShowDialog()
+    try {
+        [void]$form.ShowDialog()
+    }
+    finally {
+        Restore-UiAfterDialog -Owner $script:MainForm
+        if (-not $form.IsDisposed) { $form.Dispose() }
+    }
 }
 
 function Enable-UiErrorHandler {
     [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
     [System.Windows.Forms.Application]::add_ThreadException({
-            Show-SteamErrorDialog -ErrorObject $_.Exception
+            Restore-UiAfterDialog -Owner $script:MainForm
+            foreach ($open in @([System.Windows.Forms.Application]::OpenForms)) {
+                if ($open -and $open -ne $script:MainForm -and -not $open.IsDisposed) {
+                    try { $open.Close() } catch { }
+                }
+            }
+            if ($script:ShowingError) { return }
+            $script:ShowingError = $true
+            try {
+                Show-SteamErrorDialog -ErrorObject $_.Exception
+            }
+            finally {
+                $script:ShowingError = $false
+                Restore-UiAfterDialog -Owner $script:MainForm
+            }
         })
     [System.AppDomain]::CurrentDomain.add_UnhandledException({
-            Show-SteamErrorDialog -ErrorObject $_.ExceptionObject
+            if ($script:ShowingError) { return }
+            $script:ShowingError = $true
+            try {
+                Show-SteamErrorDialog -ErrorObject $_.ExceptionObject
+            }
+            finally {
+                $script:ShowingError = $false
+                Restore-UiAfterDialog -Owner $script:MainForm
+            }
         })
 }
 
@@ -1351,33 +1886,6 @@ function New-UiLabel {
     return $label
 }
 
-function Update-ModeBadge {
-    param(
-        $Badge,
-        [string]$Mode
-    )
-    if (-not $Badge) { return }
-    $custom = $Mode -eq 'Custom'
-    $Badge.Text = $Mode.ToUpperInvariant()
-    $Badge.ShowPip = $true
-    if ($custom) {
-        $Badge.Accent = [System.Drawing.Color]::FromArgb(102, 192, 244)
-        $Badge.Fill = [System.Drawing.Color]::FromArgb(16, 38, 54)
-        $Badge.ForeColor = [System.Drawing.Color]::FromArgb(166, 218, 247)
-    }
-    else {
-        $Badge.Accent = [System.Drawing.Color]::FromArgb(26, 159, 255)
-        $Badge.Fill = [System.Drawing.Color]::FromArgb(16, 32, 48)
-        $Badge.ForeColor = [System.Drawing.Color]::FromArgb(199, 213, 224)
-    }
-    $Badge.Font = New-UiFont -Size 7.5 -Style Bold
-    $flags = [System.Windows.Forms.TextFormatFlags]::NoPadding
-    $textW = [System.Windows.Forms.TextRenderer]::MeasureText($Badge.Text, $Badge.Font, (New-Object System.Drawing.Size(200, 22)), $flags).Width
-    $Badge.Width = [Math]::Max(78, $textW + 36 + (($Badge.Text.Length - 1) * 2))
-    $Badge.Height = 22
-    $Badge.Invalidate()
-}
-
 function New-UiButton {
     param(
         [string]$Text,
@@ -1385,13 +1893,15 @@ function New-UiButton {
         [int]$Height = 36,
         [int]$Arrow = 0,
         $Clear = $null,
-        [switch]$Primary
+        [switch]$Primary,
+        [switch]$Danger
     )
     $button = New-Object SteamButton
     $button.Text = $Text
     $button.Width = $Width
     $button.Height = $Height
     $button.IsPrimary = [bool]$Primary
+    $button.IsDanger = [bool]$Danger
     $button.Arrow = $Arrow
     $button.Font = New-UiFont -Size 9.5 -Style Bold
     $button.ForeColor = [System.Drawing.Color]::White
@@ -1416,7 +1926,7 @@ function New-PatreonLink {
     $label.BackColor = $script:Ui.Surface
     $label.ForeColor = $script:Ui.Muted
     $label.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $label.SetBounds(28, 7, 86, 22)
+    $label.SetBounds(28, 6, 86, 24)
 
     $url = $script:PatreonUrl
     $muted = $script:Ui.Muted
@@ -1437,33 +1947,6 @@ function New-PatreonLink {
     $row.Controls.Add($mark)
     $row.Controls.Add($label)
     return $row
-}
-
-function New-ToggleRow {
-    param(
-        [string]$Text,
-        [bool]$Checked,
-        $Fore = $null,
-        [int]$Width = 640
-    )
-    $row = New-Object System.Windows.Forms.Panel
-    $row.Height = 36
-    $row.Width = $Width
-    $row.BackColor = $script:Ui.Bg
-    $row.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 2)
-
-    $label = New-UiLabel -Text $Text -Size 9.5 -Fore $(if ($Fore) { $Fore } else { $script:Ui.Text })
-    $label.AutoSize = $false
-    $label.SetBounds(0, 6, [Math]::Max(80, $Width - 56), 24)
-
-    $toggle = New-Object SteamToggle
-    $toggle.Checked = $Checked
-    $toggle.ClearColor = $row.BackColor
-    $toggle.Location = New-Object System.Drawing.Point(($Width - 42), 7)
-
-    $row.Controls.Add($label)
-    $row.Controls.Add($toggle)
-    return [pscustomobject]@{ Row = $row; Toggle = $toggle }
 }
 
 function Get-CardListGutter { return 28 }
@@ -1853,13 +2336,13 @@ function New-DriveCard {
 
     $info = Get-LibraryDisplayInfo -Library $Library
     $accent = Get-DriveAccent -Drive $info.Drive
-    $custom = $script:UiMode -eq 'Custom'
+    $custom = $true
     $titleText = if ($info.Drive) { '{0} ({1})' -f $info.Label, $info.Drive } else { $info.Label }
     $m = Get-DriveCardMetrics -Width $Width -Custom $custom
 
     $card = New-Object SteamCard
     $card.Width = $Width
-    $card.Height = 118
+    $card.Height = 124
     $card.BackColor = $script:Ui.Card
     $card.ClearColor = $script:Ui.Bg
     $card.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
@@ -1869,33 +2352,33 @@ function New-DriveCard {
     $order.Name = 'index'
     $order.AutoSize = $false
     $order.BackColor = $script:Ui.Card
-    $order.SetBounds($m.IndexX, 16, 24, 22)
+    $order.SetBounds($m.IndexX, 16, 24, 24)
     $order.TextAlign = 'MiddleLeft'
 
     $name = New-UiLabel -Text $titleText -Size 12.5 -Style Bold
     $name.Name = 'text'
     $name.AutoSize = $false
     $name.BackColor = $script:Ui.Card
-    $name.SetBounds($m.TextLeft, 14, $m.TextWidth, 24)
+    $name.SetBounds($m.TextLeft, 14, $m.TextWidth, 28)
 
     $space = New-UiLabel -Text $(if ($info.Space) { $info.Space } else { $info.Path }) -Size 9 -Fore $script:Ui.Muted
     $space.Name = 'text'
     $space.AutoSize = $false
     $space.BackColor = $script:Ui.Card
-    $space.SetBounds($m.TextLeft, 40, $m.TextWidth, 18)
+    $space.SetBounds($m.TextLeft, 42, $m.TextWidth, 22)
 
     $bar = New-Object SteamUsageBar
     $bar.Name = 'bar'
     $bar.UsedPercent = [float]$info.UsedPercent
     $bar.BarBack = $script:Ui.BarBack
     $bar.BarFill = $accent
-    $bar.SetBounds($m.BarLeft, 64, $m.BarWidth, 10)
+    $bar.SetBounds($m.BarLeft, 68, $m.BarWidth, 10)
 
     $path = New-UiLabel -Text $info.Path -Size 8.5 -Fore $script:Ui.Muted
     $path.Name = 'text'
     $path.AutoSize = $false
     $path.BackColor = $script:Ui.Card
-    $path.SetBounds($m.TextLeft, 82, $m.TextWidth, 20)
+    $path.SetBounds($m.TextLeft, 86, $m.TextWidth, 22)
 
     $card.Controls.Add($path)
     $card.Controls.Add($bar)
@@ -1949,20 +2432,6 @@ function New-DriveCard {
     return $card
 }
 
-function Update-DummyChrome {
-    param($Form)
-    $dummy = Test-DummyMode
-    if ($script:DummyBanner) {
-        $script:DummyBanner.Visible = $dummy
-    }
-    if ($script:ApplyButton) {
-        $script:ApplyButton.Text = $(if ($dummy) { 'Test Apply' } else { 'Apply to Steam' })
-    }
-    if ($Form) {
-        $Form.Text = $(if ($dummy) { 'SteamDriveOrder (DUMMY)' } else { 'SteamDriveOrder' })
-    }
-}
-
 function Rebuild-DriveCards {
     if (-not $script:CardHost) { return }
     $hostPanel = $script:CardHost
@@ -1997,200 +2466,13 @@ function Rebuild-DriveCards {
         if ($cAtHome) { Hide-CDriveMoveWarning }
     }
     if ($script:HintLabel) {
-        if (Test-DummyMode) {
-            if ($script:UiMode -eq 'Custom') {
-                $script:HintLabel.Text = 'DUMMY: Drag or use arrows to practice. Test Apply will not touch Steam.'
-            }
-            else {
-                $script:HintLabel.Text = 'DUMMY: Alphabetical preview. Test Apply will not close Steam or write files.'
-            }
-        }
-        elseif ($script:UiMode -eq 'Custom') {
-            $script:HintLabel.Text = 'Drag a drive, or use the arrows, to set the Install To Order. Then apply.'
-        }
-        else {
-            $script:HintLabel.Text = 'Alphabetical preview. Apply to write this Order to Steam, or switch to Custom to rearrange.'
-        }
+        $script:HintLabel.Text = 'Drag a drive, use the arrows, or Sort A-Z. Then apply.'
     }
-}
-
-function New-ChoiceTile {
-    param(
-        [string]$Mode,
-        [string]$Heading,
-        [string]$Body,
-        [System.Drawing.Color]$Accent,
-        [int]$TileWidth = 330
-    )
-
-    $innerPad = 28
-    $innerWidth = $TileWidth - ($innerPad * 2)
-    $headingFont = New-UiFont -Size 16 -Style Bold
-    $bodyFont = New-UiFont -Size 10
-    $flags = [System.Windows.Forms.TextFormatFlags]::WordBreak
-    $headingSize = [System.Windows.Forms.TextRenderer]::MeasureText($Heading, $headingFont, (New-Object System.Drawing.Size($innerWidth, 0)), $flags)
-    $bodySize = [System.Windows.Forms.TextRenderer]::MeasureText($Body, $bodyFont, (New-Object System.Drawing.Size($innerWidth, 0)), $flags)
-    $headingH = [Math]::Max(28, $headingSize.Height)
-    $bodyH = [Math]::Max(40, $bodySize.Height + 4)
-
-    $tile = New-Object SteamCard
-    $tile.Width = $TileWidth
-    $tile.Height = 16 + $headingH + 8 + $bodyH + 20
-    $tile.BackColor = $script:Ui.Card
-    $tile.ClearColor = $script:Ui.Bg
-    $tile.TopAccent = $Accent
-    $tile.CornerRadius = 8
-    $tile.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $tile.Tag = $Mode
-    $tile.Margin = New-Object System.Windows.Forms.Padding(0, 0, 16, 0)
-
-    $h = New-UiLabel -Text $Heading -Size 16 -Style Bold -Flush
-    $h.BackColor = $script:Ui.Card
-    $h.SetBounds($innerPad, 16, $innerWidth, $headingH)
-
-    $b = New-UiLabel -Text $Body -Size 10 -Fore $script:Ui.Muted
-    $b.AutoSize = $false
-    $b.BackColor = $script:Ui.Card
-    $b.SetBounds($innerPad, (16 + $headingH + 8), $innerWidth, $bodyH)
-
-    $tile.Controls.Add($b)
-    $tile.Controls.Add($h)
-
-    $pick = {
-        $target = $this
-        while ($target -and ($null -eq $target.Tag -or [string]$target.Tag -eq '')) { $target = $target.Parent }
-        $script:ChosenMode = [string]$target.Tag
-        if ($script:PickerAfterPick) {
-            & $script:PickerAfterPick $script:ChosenMode
-        }
-        if ($script:ModeForm -and -not $script:ModeForm.IsDisposed) {
-            $script:ModeForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
-            $script:ModeForm.Close()
-        }
-    }
-    foreach ($c in @($tile, $h, $b)) { $c.Add_Click($pick) }
-    $hot = $script:Ui.CardHot
-    $normal = $script:Ui.Card
-    $hoverIn = {
-        Set-ControlBackColor $tile $hot
-        Set-ControlBackColor $h $hot
-        Set-ControlBackColor $b $hot
-    }.GetNewClosure()
-    $hoverOut = {
-        $over = $tile.RectangleToScreen($tile.ClientRectangle).Contains([System.Windows.Forms.Cursor]::Position)
-        if (-not $over) {
-            Set-ControlBackColor $tile $normal
-            Set-ControlBackColor $h $normal
-            Set-ControlBackColor $b $normal
-        }
-    }.GetNewClosure()
-    foreach ($c in @($tile, $h, $b)) {
-        $c.Add_MouseEnter($hoverIn)
-        $c.Add_MouseLeave($hoverOut)
-    }
-    return $tile
-}
-
-function Show-ModePickerDialog {
-    param(
-        [scriptblock]$AfterPick = $null
-    )
-
-    $script:PickerAfterPick = $AfterPick
-    $form = New-Object SteamForm
-    $form.Text = $(if (Test-DummyMode) { 'SteamDriveOrder (DUMMY)' } else { 'SteamDriveOrder' })
-    $form.StartPosition = 'CenterScreen'
-    $form.AutoSize = $true
-    $form.AutoSizeMode = 'GrowAndShrink'
-    $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-    $form.BackColor = $script:Ui.Bg
-    $form.ForeColor = $script:Ui.Text
-    $form.Font = New-UiFont
-    $form.ShowIcon = $false
-    $form.Padding = New-Object System.Windows.Forms.Padding(0)
-    Enable-DoubleBuffer -Control $form
-    Enable-DarkTitleBar -Form $form
-    $script:ModeForm = $form
-
-    $root = New-Object System.Windows.Forms.FlowLayoutPanel
-    $root.FlowDirection = 'TopDown'
-    $root.AutoSize = $true
-    $root.AutoSizeMode = 'GrowAndShrink'
-    $root.WrapContents = $false
-    $root.BackColor = $script:Ui.Bg
-    $root.Padding = New-Object System.Windows.Forms.Padding(40, 32, 40, 28)
-
-    $title = New-UiLabel -Text 'How should Steam list your drives?' -Size 18 -Style Bold -Auto
-    $title.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 18)
-
-    $tileRow = New-Object System.Windows.Forms.FlowLayoutPanel
-    $tileRow.FlowDirection = 'LeftToRight'
-    $tileRow.AutoSize = $true
-    $tileRow.AutoSizeMode = 'GrowAndShrink'
-    $tileRow.WrapContents = $false
-    $tileRow.BackColor = $script:Ui.Bg
-    $tileRow.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 16)
-
-    $alpha = New-ChoiceTile -Mode 'Alphabetical' -Heading 'Alphabetical' -Body 'Sort by drive letter: C, D, E, F. Best default if you just want them in order.' -Accent $script:Ui.Accent
-    $custom = New-ChoiceTile -Mode 'Custom' -Heading 'Custom' -Body 'Drag the drives into any order you want. Fastest SSD first, HDD last - your call.' -Accent $script:Ui.Accent2
-    $custom.Margin = New-Object System.Windows.Forms.Padding(0)
-    $tileHeight = [Math]::Max($alpha.Height, $custom.Height)
-    $alpha.Height = $tileHeight
-    $custom.Height = $tileHeight
-    [void]$tileRow.Controls.Add($alpha)
-    [void]$tileRow.Controls.Add($custom)
-
-    $rowWidth = 676
-    $keepRow = New-ToggleRow -Text 'Keep the Steam install drive first when sorting A-Z' -Checked $true -Fore $script:Ui.Muted -Width $rowWidth
-    $script:KeepClientFirstUi = $keepRow.Toggle
-    $dummyRow = New-ToggleRow -Text 'Dummy / practice mode (do not close Steam or write files)' -Checked (Test-DummyMode) -Fore $script:Ui.AccentSoft -Width $rowWidth
-    $dummyRow.Toggle.Add_CheckedChanged({ $script:DummyMode = $this.Checked })
-
-    $cancelRow = New-Object System.Windows.Forms.FlowLayoutPanel
-    $cancelRow.FlowDirection = 'RightToLeft'
-    $cancelRow.AutoSize = $true
-    $cancelRow.WrapContents = $false
-    $cancelRow.BackColor = $script:Ui.Bg
-    $cancelRow.Margin = New-Object System.Windows.Forms.Padding(0, 12, 0, 0)
-    $cancel = New-UiButton -Text 'Cancel' -Width 110 -Height 34
-    $cancel.Add_Click({ $script:ModeForm.Close() })
-    [void]$cancelRow.Controls.Add($cancel)
-
-    [void]$root.Controls.Add($title)
-    [void]$root.Controls.Add($tileRow)
-    [void]$root.Controls.Add($keepRow.Row)
-    [void]$root.Controls.Add($dummyRow.Row)
-    [void]$root.Controls.Add($cancelRow)
-    $form.Controls.Add($root)
-
-    $form.Add_Shown({
-            $cancelRow.Width = $tileRow.Width
-        }.GetNewClosure())
-
-    $script:ChosenMode = $null
-    [void]$form.ShowDialog()
-    $script:PickerAfterPick = $null
-    return $script:ChosenMode
 }
 
 function Show-SteamDriveOrderWindow {
-    param([string]$Mode)
-
-    $script:UiMode = $Mode
-    $keepFirst = $true
-    if ($script:KeepClientFirstUi) {
-        $keepFirst = [bool]$script:KeepClientFirstUi.Checked
-    }
-    if ($Mode -eq 'Alphabetical') {
-        $keepPath = $null
-        if ($keepFirst) { $keepPath = $script:SteamPath }
-        $script:Libraries = Sort-LibrariesByDrive -Libraries $script:Libraries -KeepFirstPath $keepPath
-    }
-
     $form = New-Object SteamForm
-    $form.Text = $(if (Test-DummyMode) { 'SteamDriveOrder (DUMMY)' } else { 'SteamDriveOrder' })
+    $form.Text = 'SteamDriveOrder'
     $form.StartPosition = 'CenterScreen'
     $form.Size = New-Object System.Drawing.Size(860, 680)
     $form.MinimumSize = New-Object System.Drawing.Size(760, 560)
@@ -2201,15 +2483,7 @@ function Show-SteamDriveOrderWindow {
     Enable-DoubleBuffer -Control $form
     Enable-DarkTitleBar -Form $form
 
-    $dummyBanner = New-UiLabel -Text 'DUMMY MODE  -  Steam stays open. No library files will be written.' -Size 9 -Style Bold -Fore $script:Ui.Bg
-    $dummyBanner.Dock = 'Top'
-    $dummyBanner.Height = 28
-    $dummyBanner.TextAlign = 'MiddleCenter'
-    $dummyBanner.BackColor = $script:Ui.Accent2
-    $dummyBanner.Visible = Test-DummyMode
-    $script:DummyBanner = $dummyBanner
-
-    $warnBanner = New-UiLabel -Text 'Moving the C Drive is not recommended' -Size 9.5 -Style Bold -Fore $script:Ui.Bg
+    $warnBanner = New-UiLabel -Text 'Moving the C Drive is not recommended' -Size 9.5 -Style Bold -Fore $script:Ui.Text
     $warnBanner.Dock = 'Top'
     $warnBanner.Height = 32
     $warnBanner.TextAlign = 'MiddleCenter'
@@ -2219,7 +2493,7 @@ function Show-SteamDriveOrderWindow {
 
     $header = New-Object System.Windows.Forms.Panel
     $header.Dock = 'Top'
-    $header.Height = 126
+    $header.Height = 136
     $header.BackColor = $script:Ui.Surface
 
     $accentLine = New-Object System.Windows.Forms.Panel
@@ -2227,16 +2501,11 @@ function Show-SteamDriveOrderWindow {
     $accentLine.Dock = 'Top'
     $accentLine.BackColor = $script:Ui.Accent
 
-    $headerLeft = Get-CardListGutter
-    $kicker = New-UiLabel -Text 'STORAGE' -Size 8 -Style Bold -Fore $script:Ui.AccentSoft -Flush
+    $kicker = New-UiLabel -Text 'STORAGE' -Size 8 -Style Bold -Fore $script:Ui.Accent -Flush
     $kicker.BackColor = $script:Ui.Surface
 
     $title = New-UiLabel -Text 'Library Order' -Size 20 -Style Bold -Flush
     $title.BackColor = $script:Ui.Surface
-
-    $modeBadge = New-Object SteamBadge
-    $modeBadge.ClearColor = $script:Ui.Surface
-    Update-ModeBadge -Badge $modeBadge -Mode $Mode
 
     $hint = New-UiLabel -Text '' -Size 9.5 -Fore $script:Ui.Muted -Flush
     $hint.BackColor = $script:Ui.Surface
@@ -2248,7 +2517,7 @@ function Show-SteamDriveOrderWindow {
     $placeHeaderText = {
         $left = Get-CardListGutter
         $textW = [Math]::Max(160, $header.ClientSize.Width - $left - 28)
-        $kicker.SetBounds($left, 14, $textW, 16)
+        $kicker.SetBounds($left, 14, $textW, 18)
         $titleFlags = [System.Windows.Forms.TextFormatFlags]::NoPadding
         $titleWidth = [System.Windows.Forms.TextRenderer]::MeasureText(
             $title.Text,
@@ -2257,9 +2526,8 @@ function Show-SteamDriveOrderWindow {
             $titleFlags
         ).Width
         $title.SetBounds($left, 32, [Math]::Max(80, $titleWidth + 4), 40)
-        $modeBadge.Location = New-Object System.Drawing.Point(($left + $titleWidth + 12), 41)
-        $hint.SetBounds($left, 72, $textW, 20)
-        $pathLabel.SetBounds($left, 94, $textW, 18)
+        $hint.SetBounds($left, 72, $textW, 26)
+        $pathLabel.SetBounds($left, 100, $textW, 22)
     }
     $header.Add_Resize({ & $placeHeaderText }.GetNewClosure())
     & $placeHeaderText
@@ -2267,7 +2535,6 @@ function Show-SteamDriveOrderWindow {
     $header.Controls.Add($accentLine)
     $header.Controls.Add($kicker)
     $header.Controls.Add($title)
-    $header.Controls.Add($modeBadge)
     $header.Controls.Add($hint)
     $header.Controls.Add($pathLabel)
 
@@ -2278,80 +2545,32 @@ function Show-SteamDriveOrderWindow {
 
     $patreonLink = New-PatreonLink
     $patreonLink.Location = New-Object System.Drawing.Point((Get-CardListGutter), 21)
+    $script:PatreonRow = $patreonLink
 
-    $btnMode = New-UiButton -Text 'Change Mode' -Width 130 -Height 36
     $btnSort = New-UiButton -Text 'Sort A-Z' -Width 110 -Height 36
-    $btnApply = New-UiButton -Text $(if (Test-DummyMode) { 'Test Apply' } else { 'Apply to Steam' }) -Width 160 -Height 36 -Primary
+    $btnForce = New-UiButton -Text 'Force' -Width 88 -Height 36 -Danger
+    $btnForce.Visible = $false
+    $btnApply = New-UiButton -Text 'Apply to Steam' -Width 168 -Height 36 -Primary
+    $script:SortButton = $btnSort
+    $script:ForceButton = $btnForce
     $script:ApplyButton = $btnApply
-
-    $placeFooterButtons = {
-        $gutter = Get-CardListGutter
-        $gap = 10
-        $btnApply.Top = 20
-        $btnSort.Top = 20
-        $btnMode.Top = 20
-        $btnApply.Left = $footer.Width - $gutter - $btnApply.Width
-        $btnSort.Left = $btnApply.Left - $gap - $btnSort.Width
-        $btnMode.Left = $btnSort.Left - $gap - $btnMode.Width
-        $patreonLink.Left = $gutter
-        $patreonLink.Top = 21
-    }
-
-    $btnMode.Add_Click({
-            $picked = Show-ModePickerDialog
-            if (-not $picked) { return }
-            Set-UiMode $picked
-            Update-ModeBadge -Badge $modeBadge -Mode $picked
-            if ($picked -eq 'Alphabetical') {
-                Invoke-SortLibrariesAz
-            }
-            Update-DummyChrome -Form $form
-            Rebuild-DriveCards
-        }.GetNewClosure())
+    $script:FooterPanel = $footer
+    $script:MainForm = $form
+    Update-ApplyButton
 
     $btnSort.Add_Click({
             Invoke-SortLibrariesAz
-            Update-ModeBadge -Badge $modeBadge -Mode 'Alphabetical'
             Rebuild-DriveCards
-        }.GetNewClosure())
-
-    $btnApply.Add_Click({
-            $dummy = Test-DummyMode
-            $prompt = if ($dummy) {
-                "DUMMY MODE`n`nSteam will stay open.`nNo libraryfolders.vdf files will be written.`nThis only tests the apply path.`n`nContinue?"
-            }
-            else {
-                "Steam will close if it is running.`nBoth libraryfolders.vdf files will be updated.`nSteam will then reopen so the new Install to order is used.`nA backup is created first.`n`nContinue?"
-            }
-            $answer = [System.Windows.Forms.MessageBox]::Show(
-                $form,
-                $prompt,
-                $(if ($dummy) { 'Dummy apply' } else { 'Apply library order' }),
-                'OKCancel',
-                'Question'
-            )
-            if ($answer -ne [System.Windows.Forms.DialogResult]::OK) { return }
-            try {
-                $backup = Invoke-UiApplyOrder
-                if (Test-DummyMode) {
-                    Set-HintText 'Dummy apply succeeded. Steam was not closed and no files were written.'
-                    [System.Windows.Forms.MessageBox]::Show($form, "Dummy apply succeeded.`n`nSteam is still running.`nNo library files were changed.", 'SteamDriveOrder (DUMMY)', 'OK', 'Information') | Out-Null
-                }
-                else {
-                    Set-HintText "Saved. Steam is restarting. Backup: $backup"
-                    [System.Windows.Forms.MessageBox]::Show($form, "Library order saved.`n`nSteam is restarting so the new order is used.`n`nBackup:`n$backup", 'SteamDriveOrder', 'OK', 'Information') | Out-Null
-                }
-            }
-            catch {
-                [System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, 'Could not apply order', 'OK', 'Error') | Out-Null
-            }
-        }.GetNewClosure())
+        })
+    $btnForce.Add_Click({ Invoke-ForceSteamClose })
+    $btnApply.Add_Click({ Invoke-ApplyButtonClick })
 
     $footer.Controls.Add($patreonLink)
-    $footer.Controls.Add($btnMode)
     $footer.Controls.Add($btnSort)
+    $footer.Controls.Add($btnForce)
     $footer.Controls.Add($btnApply)
-    $footer.Add_Resize({ & $placeFooterButtons }.GetNewClosure())
+    $footer.Add_Resize({ Update-FooterButtons })
+    Update-FooterButtons
 
     $hostPanel = New-Object SteamScrollView
     $script:CardHost = $hostPanel
@@ -2361,6 +2580,7 @@ function Show-SteamDriveOrderWindow {
     Enable-DoubleBuffer -Control $hostPanel
 
     $form.Add_FormClosed({
+            Stop-ApplyUiTimers
             if ($script:Drag -and $script:Drag.Active) { Stop-CardDrag }
         })
 
@@ -2386,11 +2606,12 @@ function Show-SteamDriveOrderWindow {
     $form.Controls.Add($footer)
     $form.Controls.Add($warnBanner)
     $form.Controls.Add($header)
-    $form.Controls.Add($dummyBanner)
     $form.Add_Shown({
-            & $placeFooterButtons
+            Update-FooterButtons
             Rebuild-DriveCards
-        }.GetNewClosure())
+            Update-ApplyButton
+            Start-ApplyIdleWatch
+        })
     [void]$form.ShowDialog()
 }
 
@@ -2408,12 +2629,7 @@ function Invoke-SteamDriveOrder {
     $script:Libraries = $list
     $script:SteamPath = $steam
     $script:Drag = New-CardDragState
-    $script:PickerAfterPick = $null
-    $mode = Show-ModePickerDialog -AfterPick {
-        param($picked)
-        Show-SteamDriveOrderWindow -Mode $picked
-    }
-    if (-not $mode) { return }
+    Show-SteamDriveOrderWindow
 }
 
 if (-not $SkipMain) {
