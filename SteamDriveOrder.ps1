@@ -991,8 +991,10 @@ public static class SteamDriveOrderDpi {
     if (-not ('SteamChrome' -as [type])) {
         Add-Type -ReferencedAssemblies @('System.Windows.Forms.dll', 'System.Drawing.dll') -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -1223,6 +1225,7 @@ public class SteamCard : Panel {
 
 public class SteamText : Label {
     public bool Wrap;
+    static readonly Dictionary<string, int> InkCache = new Dictionary<string, int>();
     public SteamText() {
         AutoSize = false;
         UseMnemonic = false;
@@ -1231,14 +1234,60 @@ public class SteamText : Label {
         UseCompatibleTextRendering = false;
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
     }
+    static int MeasureLeftInk(string text, Font font, TextFormatFlags flags) {
+        Size size = TextRenderer.MeasureText(text, font, new Size(int.MaxValue, int.MaxValue), flags);
+        int w = Math.Max(8, size.Width + 8);
+        int h = Math.Max(8, size.Height + 8);
+        using (Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
+            using (Graphics g = Graphics.FromImage(bmp)) {
+                g.Clear(Color.Black);
+                TextRenderer.DrawText(g, text, font, new Point(4, 4), Color.White, flags);
+            }
+            BitmapData data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try {
+                int stride = data.Stride;
+                byte[] bytes = new byte[stride * bmp.Height];
+                Marshal.Copy(data.Scan0, bytes, 0, bytes.Length);
+                for (int x = 0; x < bmp.Width; x++) {
+                    for (int y = 0; y < bmp.Height; y++) {
+                        int i = y * stride + x * 4;
+                        if (bytes[i] > 8 || bytes[i + 1] > 8 || bytes[i + 2] > 8)
+                            return x - 4;
+                    }
+                }
+            }
+            finally {
+                bmp.UnlockBits(data);
+            }
+        }
+        return 0;
+    }
+    static int LeftInk(string text, Font font, TextFormatFlags flags) {
+        string key = text + "|" + font.Name + "|" + font.Size + "|" + ((int)font.Style) + "|" + ((int)flags);
+        int ink;
+        if (InkCache.TryGetValue(key, out ink)) return ink;
+        ink = MeasureLeftInk(text, font, flags);
+        InkCache[key] = ink;
+        return ink;
+    }
     protected override void OnPaint(PaintEventArgs e) {
         using (SolidBrush b = new SolidBrush(BackColor))
             e.Graphics.FillRectangle(b, ClientRectangle);
         if (string.IsNullOrEmpty(Text)) return;
-        TextFormatFlags flags = TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.GlyphOverhangPadding;
-        if (Wrap) flags |= TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl;
-        else flags |= TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis;
-        TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor, flags);
+        TextFormatFlags flags = TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+        if (Wrap) {
+            flags |= TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl;
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor, flags);
+            return;
+        }
+        flags |= TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis;
+        int ink = LeftInk(Text, Font, flags);
+        Rectangle box = ClientRectangle;
+        if (ink != 0) {
+            box.X -= ink;
+            box.Width += ink;
+        }
+        TextRenderer.DrawText(e.Graphics, Text, Font, box, ForeColor, flags);
     }
 }
 
@@ -2517,17 +2566,10 @@ function Show-SteamDriveOrderWindow {
     $placeHeaderText = {
         $left = Get-CardListGutter
         $textW = [Math]::Max(160, $header.ClientSize.Width - $left - 28)
-        $kicker.SetBounds($left, 14, $textW, 18)
-        $titleFlags = [System.Windows.Forms.TextFormatFlags]::NoPadding
-        $titleWidth = [System.Windows.Forms.TextRenderer]::MeasureText(
-            $title.Text,
-            $title.Font,
-            (New-Object System.Drawing.Size(400, 40)),
-            $titleFlags
-        ).Width
-        $title.SetBounds($left, 32, [Math]::Max(80, $titleWidth + 4), 40)
-        $hint.SetBounds($left, 72, $textW, 26)
-        $pathLabel.SetBounds($left, 100, $textW, 22)
+        $kicker.SetBounds($left, 14, $textW, 20)
+        $title.SetBounds($left, 32, $textW, 42)
+        $hint.SetBounds($left, 74, $textW, 28)
+        $pathLabel.SetBounds($left, 102, $textW, 22)
     }
     $header.Add_Resize({ & $placeHeaderText }.GetNewClosure())
     & $placeHeaderText
