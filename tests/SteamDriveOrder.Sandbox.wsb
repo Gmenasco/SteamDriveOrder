@@ -1,0 +1,13 @@
+<Configuration>
+  <VGpu>Enable</VGpu>
+  <Networking>Disable</Networking>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>C:\Users\Garrett\Projects\SteamDriveOrder</HostFolder>
+      <SandboxFolder>C:\SteamDriveOrder</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <ClipboardRedirection>true</ClipboardRedirection>
+  <MemoryInMB>4096</MemoryInMB>
+</Configuration>

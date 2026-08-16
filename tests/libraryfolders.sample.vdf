@@ -1,0 +1,45 @@
+"libraryfolders"
+{
+	"0"
+	{
+		"path"		"C:\\Program Files (x86)\\Steam"
+		"label"		""
+		"contentid"		"111"
+		"totalsize"		"0"
+		"apps"
+		{
+			"228980"		"100"
+		}
+	}
+	"1"
+	{
+		"path"		"E:\\SteamLibrary"
+		"label"		""
+		"contentid"		"222"
+		"totalsize"		"1000"
+		"apps"
+		{
+		}
+	}
+	"2"
+	{
+		"path"		"D:\\SteamLibrary"
+		"label"		""
+		"contentid"		"333"
+		"totalsize"		"2000"
+		"apps"
+		{
+			"223850"		"200"
+		}
+	}
+	"3"
+	{
+		"path"		"F:\\SteamLibrary"
+		"label"		""
+		"contentid"		"444"
+		"totalsize"		"3000"
+		"apps"
+		{
+		}
+	}
+}
