@@ -70,6 +70,11 @@ $script:Libraries = $fixed
 Move-LibraryInList -From 2 -To 0
 Assert-Equal 'D:\SteamLibrary' $script:Libraries[0].Path 'move D to slot 1 from a fixed array'
 Assert-Equal 'C:\Program Files (x86)\Steam' $script:Libraries[1].Path 'C shifts down after D moves first'
+Assert-Equal $true (Test-CDriveIsMisplaced) 'C is misplaced after D takes slot 1'
+Assert-Equal $true (Test-CDriveIsMisplaced -From 2 -To 0) 'preview of E to slot 1 misplaces C'
+Set-LibraryList $entries.Libraries
+Assert-Equal $false (Test-CDriveIsMisplaced) 'C is home in the original order'
+Assert-Equal $true (Test-CDriveIsMisplaced -From 2 -To 0) 'preview of D to slot 1 misplaces C'
 
 $fakeRoot = Join-Path $env:TEMP ("SteamDriveOrder-tests-" + [guid]::NewGuid().ToString('N'))
 $fakeSteam = Join-Path $fakeRoot 'Steam'
