@@ -49,6 +49,8 @@ Assert-Equal $true ($summary -is [string]) 'close summary is a string'
 
 Assert-Equal 'C' (Get-PathDriveLetter 'C:\Program Files (x86)\Steam') 'drive letter C'
 Assert-Equal 'D' (Get-PathDriveLetter 'D:\SteamLibrary') 'drive letter D'
+Assert-Equal 'C:\Program Files (x86)\Steam' (Format-DisplayPath 'c:\program files (x86)\steam') 'display path uses Program Files casing'
+Assert-Equal 'D:\SteamLibrary' (Format-DisplayPath 'd:\steamlibrary') 'display path uses SteamLibrary casing'
 
 Assert-Equal '512 GB' (Format-Gib (512GB)) 'format 512 GB'
 Assert-Equal '1.00 TB' (Format-Gib (1024GB)) 'format 1024 GB as TB'
@@ -60,6 +62,14 @@ Move-LibraryInList -From 1 -To 2
 Assert-Equal 'D:\SteamLibrary' $script:Libraries[1].Path 'move E past D'
 Assert-Equal 'E:\SteamLibrary' $script:Libraries[2].Path 'E lands in slot 3'
 Assert-Equal '333' $script:Libraries[1].Block['contentid'] 'moved block keeps D contentid'
+
+$fixed = New-Object object[] $entries.Libraries.Count
+$i = 0
+foreach ($lib in $entries.Libraries) { $fixed[$i] = $lib; $i++ }
+$script:Libraries = $fixed
+Move-LibraryInList -From 2 -To 0
+Assert-Equal 'D:\SteamLibrary' $script:Libraries[0].Path 'move D to slot 1 from a fixed array'
+Assert-Equal 'C:\Program Files (x86)\Steam' $script:Libraries[1].Path 'C shifts down after D moves first'
 
 $fakeRoot = Join-Path $env:TEMP ("SteamDriveOrder-tests-" + [guid]::NewGuid().ToString('N'))
 $fakeSteam = Join-Path $fakeRoot 'Steam'

@@ -290,7 +290,7 @@ function Sort-LibrariesByDrive {
     $result = New-Object System.Collections.Generic.List[object]
     if ($head) { $result.Add($head) }
     foreach ($item in $sorted) { $result.Add($item) }
-    return $result
+    return , $result
 }
 
 function Get-SteamInstallPath {
@@ -454,7 +454,7 @@ function Get-LibraryDisplayInfo {
         Label       = $label
         Space       = $spaceText
         UsedPercent = $usedPercent
-        Path        = $Library.Path
+        Path        = Format-DisplayPath $Library.Path
     }
 }
 
@@ -595,7 +595,7 @@ function Invoke-SortLibrariesAz {
     if ($script:KeepClientFirst) {
         $keepPath = $script:SteamPath
     }
-    $script:Libraries = Sort-LibrariesByDrive -Libraries $script:Libraries -KeepFirstPath $keepPath
+    Set-LibraryList (Sort-LibrariesByDrive -Libraries $script:Libraries -KeepFirstPath $keepPath)
 }
 
 function Invoke-UiApplyOrder {
@@ -1002,10 +1002,44 @@ using System.Windows.Forms;
 public static class SteamChrome {
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    [DllImport("user32.dll")]
+    public static extern bool ReleaseCapture();
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
     public static void UseDarkTitleBar(IntPtr hwnd) {
         int useDark = 1;
         DwmSetWindowAttribute(hwnd, 20, ref useDark, 4);
         DwmSetWindowAttribute(hwnd, 19, ref useDark, 4);
+        int round = 3;
+        DwmSetWindowAttribute(hwnd, 33, ref round, 4);
+        int chrome = 0x0028201B;
+        DwmSetWindowAttribute(hwnd, 34, ref chrome, 4);
+    }
+    public static void DragWindow(Form form) {
+        if (form == null || form.WindowState == FormWindowState.Maximized) return;
+        ReleaseCapture();
+        SendMessage(form.Handle, 0xA1, 2, 0);
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MINMAXINFO {
+        public POINT Reserved;
+        public POINT MaxSize;
+        public POINT MaxPosition;
+        public POINT MinTrackSize;
+        public POINT MaxTrackSize;
+    }
+    public static void FitMaximizeToWorkingArea(IntPtr hwnd, IntPtr lParam) {
+        MINMAXINFO info = (MINMAXINFO)Marshal.PtrToStructure(lParam, typeof(MINMAXINFO));
+        Screen screen = Screen.FromHandle(hwnd);
+        Rectangle work = screen.WorkingArea;
+        Rectangle bounds = screen.Bounds;
+        info.MaxPosition.X = work.Left - bounds.Left;
+        info.MaxPosition.Y = work.Top - bounds.Top;
+        info.MaxSize.X = work.Width;
+        info.MaxSize.Y = work.Height;
+        Marshal.StructureToPtr(info, lParam, true);
     }
 
     public static GraphicsPath RoundRect(Rectangle r, int radius) {
@@ -1026,26 +1060,239 @@ public static class SteamChrome {
     }
 }
 
+public class SteamCaptionButton : Control {
+    public int Kind;
+    bool _hot;
+    public SteamCaptionButton() {
+        Width = 46;
+        Height = 32;
+        Cursor = Cursors.Hand;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+    protected override void OnMouseEnter(EventArgs e) { _hot = true; Invalidate(); }
+    protected override void OnMouseLeave(EventArgs e) { _hot = false; Invalidate(); }
+    protected override void OnClick(EventArgs e) {
+        Form f = FindForm();
+        if (f == null) return;
+        if (Kind == 2) f.Close();
+        else if (Kind == 0) f.WindowState = FormWindowState.Minimized;
+        else f.WindowState = f.WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+        base.OnClick(e);
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        Color fill = BackColor;
+        if (_hot) fill = Kind == 2 ? Color.FromArgb(196, 54, 54) : Color.FromArgb(45, 50, 58);
+        using (SolidBrush br = new SolidBrush(fill))
+            g.FillRectangle(br, ClientRectangle);
+        Color ink = _hot && Kind == 2 ? Color.White : Color.FromArgb(199, 213, 224);
+        using (Pen pen = new Pen(ink, 1.2f)) {
+            pen.StartCap = LineCap.Round;
+            pen.EndCap = LineCap.Round;
+            float cx = Width / 2f;
+            float cy = Height / 2f;
+            if (Kind == 0) {
+                g.DrawLine(pen, cx - 5f, cy, cx + 5f, cy);
+            } else if (Kind == 1) {
+                Form f = FindForm();
+                if (f != null && f.WindowState == FormWindowState.Maximized) {
+                    g.DrawRectangle(pen, cx - 3f, cy - 5f, 8f, 8f);
+                    g.DrawRectangle(pen, cx - 6f, cy - 2f, 8f, 8f);
+                } else {
+                    g.DrawRectangle(pen, cx - 5f, cy - 5f, 10f, 10f);
+                }
+            } else {
+                g.DrawLine(pen, cx - 4.5f, cy - 4.5f, cx + 4.5f, cy + 4.5f);
+                g.DrawLine(pen, cx + 4.5f, cy - 4.5f, cx - 4.5f, cy + 4.5f);
+            }
+        }
+    }
+}
+
+public class SteamCaption : Panel {
+    public SteamCaptionButton MinButton;
+    public SteamCaptionButton MaxButton;
+    public SteamCaptionButton CloseButton;
+    public bool ShowTitle = true;
+    public SteamCaption() {
+        Height = 32;
+        Dock = DockStyle.Top;
+        BackColor = Color.FromArgb(23, 26, 33);
+        ForeColor = Color.FromArgb(199, 213, 224);
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        CloseButton = new SteamCaptionButton { Kind = 2, Dock = DockStyle.Right, BackColor = BackColor };
+        MaxButton = new SteamCaptionButton { Kind = 1, Dock = DockStyle.Right, BackColor = BackColor };
+        MinButton = new SteamCaptionButton { Kind = 0, Dock = DockStyle.Right, BackColor = BackColor };
+        Controls.Add(MinButton);
+        Controls.Add(MaxButton);
+        Controls.Add(CloseButton);
+    }
+    protected override void OnMouseDown(MouseEventArgs e) {
+        if (e.Button == MouseButtons.Left) {
+            Form f = FindForm();
+            if (e.Clicks >= 2 && f != null && f.MaximizeBox) {
+                f.WindowState = f.WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+            } else {
+                SteamChrome.DragWindow(f);
+            }
+        }
+        base.OnMouseDown(e);
+    }
+    protected override void OnPaint(PaintEventArgs e) {
+        using (SolidBrush br = new SolidBrush(BackColor))
+            e.Graphics.FillRectangle(br, ClientRectangle);
+        Form f = FindForm();
+        string title = (ShowTitle && f != null) ? f.Text : "";
+        if (!string.IsNullOrEmpty(title)) {
+            Rectangle box = new Rectangle(12, 0, Math.Max(40, Width - 150), Height);
+            TextRenderer.DrawText(e.Graphics, title, Font, box, ForeColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+        }
+    }
+}
+
 public class SteamForm : Form {
     bool _shown;
+    bool _canResize = true;
+    public bool FadeInOnShow;
+    public bool OverlayCaption;
+    public SteamCaption CaptionBar;
+    public bool CanResize {
+        get { return _canResize; }
+        set { _canResize = value; }
+    }
     public SteamForm() {
+        FormBorderStyle = FormBorderStyle.None;
+        ControlBox = false;
+        ShowIcon = false;
+        MinimizeBox = true;
+        MaximizeBox = true;
         BackColor = Color.FromArgb(27, 32, 40);
         ForeColor = Color.FromArgb(220, 222, 223);
         DoubleBuffered = true;
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         UpdateStyles();
-        Opacity = 0d;
+        Opacity = 1d;
+        CaptionBar = new SteamCaption();
+        CaptionBar.Font = new Font("Segoe UI", 9f, FontStyle.Regular);
+        Controls.Add(CaptionBar);
+    }
+    public void SetCaptionButtons(bool minimize, bool maximize) {
+        MinimizeBox = minimize;
+        MaximizeBox = maximize;
+        CaptionBar.MinButton.Visible = minimize;
+        CaptionBar.MaxButton.Visible = maximize;
+        LayoutCaption();
+    }
+    public void SetCaptionOverlay(bool overlay) {
+        OverlayCaption = overlay;
+        CaptionBar.ShowTitle = !overlay;
+        LayoutCaption();
+    }
+    public void LayoutCaption() {
+        if (CaptionBar == null) return;
+        int btn = 46;
+        int w = btn;
+        if (CaptionBar.MinButton.Visible) w += btn;
+        if (CaptionBar.MaxButton.Visible) w += btn;
+        if (OverlayCaption) {
+            CaptionBar.Dock = DockStyle.None;
+            CaptionBar.Width = w;
+            CaptionBar.Height = 32;
+            int left = ClientSize.Width - w;
+            if (left < 0) left = 0;
+            CaptionBar.Left = left;
+            CaptionBar.Top = 0;
+            int x = w;
+            CaptionBar.CloseButton.Dock = DockStyle.None;
+            CaptionBar.MaxButton.Dock = DockStyle.None;
+            CaptionBar.MinButton.Dock = DockStyle.None;
+            x -= btn;
+            CaptionBar.CloseButton.SetBounds(x, 0, btn, 32);
+            if (CaptionBar.MaxButton.Visible) {
+                x -= btn;
+                CaptionBar.MaxButton.SetBounds(x, 0, btn, 32);
+            }
+            if (CaptionBar.MinButton.Visible) {
+                x -= btn;
+                CaptionBar.MinButton.SetBounds(x, 0, btn, 32);
+            }
+            CaptionBar.BringToFront();
+        } else {
+            CaptionBar.CloseButton.Dock = DockStyle.Right;
+            CaptionBar.MaxButton.Dock = DockStyle.Right;
+            CaptionBar.MinButton.Dock = DockStyle.Right;
+            CaptionBar.Dock = DockStyle.Top;
+            CaptionBar.Height = 32;
+            CaptionBar.SendToBack();
+        }
     }
     protected override CreateParams CreateParams {
         get {
             CreateParams cp = base.CreateParams;
-            cp.ExStyle |= 0x02000000;
+            cp.Style |= 0x00080000;
+            if (_canResize) {
+                cp.Style |= 0x00040000;
+                cp.Style |= 0x00020000;
+                cp.Style |= 0x00010000;
+            }
             return cp;
         }
+    }
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        try { SteamChrome.UseDarkTitleBar(Handle); } catch { }
+    }
+    protected override void OnControlAdded(ControlEventArgs e) {
+        base.OnControlAdded(e);
+        if (CaptionBar != null) LayoutCaption();
+    }
+    protected override void OnTextChanged(EventArgs e) {
+        base.OnTextChanged(e);
+        if (CaptionBar != null) CaptionBar.Invalidate();
+    }
+    protected override void OnFontChanged(EventArgs e) {
+        base.OnFontChanged(e);
+        if (CaptionBar != null) CaptionBar.Font = Font;
+    }
+    protected override void OnResize(EventArgs e) {
+        if (WindowState == FormWindowState.Minimized) return;
+        if (CaptionBar != null) {
+            CaptionBar.MaxButton.Invalidate();
+            LayoutCaption();
+        }
+        base.OnResize(e);
     }
     protected override void WndProc(ref Message m) {
         if (m.Msg == 0x0014) {
             m.Result = (IntPtr)1;
+            return;
+        }
+        if (m.Msg == 0x0024) {
+            base.WndProc(ref m);
+            try { SteamChrome.FitMaximizeToWorkingArea(Handle, m.LParam); } catch { }
+            return;
+        }
+        if (m.Msg == 0x0084 && CanResize && WindowState == FormWindowState.Normal) {
+            base.WndProc(ref m);
+            long lp = m.LParam.ToInt64();
+            Point screen = new Point(unchecked((short)(lp & 0xFFFF)), unchecked((short)((lp >> 16) & 0xFFFF)));
+            Point p = PointToClient(screen);
+            int grip = 8;
+            bool left = p.X <= grip;
+            bool right = p.X >= Width - grip;
+            bool top = p.Y <= grip;
+            bool bottom = p.Y >= Height - grip;
+            if (top && left) m.Result = (IntPtr)13;
+            else if (top && right) m.Result = (IntPtr)14;
+            else if (bottom && left) m.Result = (IntPtr)16;
+            else if (bottom && right) m.Result = (IntPtr)17;
+            else if (left) m.Result = (IntPtr)10;
+            else if (right) m.Result = (IntPtr)11;
+            else if (top) m.Result = (IntPtr)12;
+            else if (bottom) m.Result = (IntPtr)15;
             return;
         }
         base.WndProc(ref m);
@@ -1062,6 +1309,7 @@ public class SteamForm : Form {
         if (!_shown) {
             _shown = true;
             Opacity = 1d;
+            LayoutCaption();
             Update();
         }
         base.OnShown(e);
@@ -1626,19 +1874,15 @@ function Show-SteamPrompt {
     $box = $ui.Card
     $headingText = if ([string]::IsNullOrWhiteSpace($Title)) { 'SteamDriveOrder' } else { $Title }
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-Object SteamForm
     $form.Text = $headingText
-    $form.FormBorderStyle = 'None'
     $form.StartPosition = $(if ($Owner -and -not $Owner.IsDisposed) { 'CenterParent' } else { 'CenterScreen' })
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-    $form.ControlBox = $false
+    $form.CanResize = $false
+    $form.SetCaptionButtons($false, $false)
     $form.ShowInTaskbar = $false
-    $form.ShowIcon = $false
-    $form.BackColor = $chrome
     $form.ForeColor = $ui.Text
     $form.Font = New-UiFont
-    $form.ClientSize = New-Object System.Drawing.Size -ArgumentList 480, 200
+    $form.ClientSize = New-Object System.Drawing.Size -ArgumentList 480, 232
     Enable-DoubleBuffer -Control $form
 
     $card = New-Object SteamCard
@@ -1699,8 +1943,9 @@ function Show-SteamPrompt {
 
     $place = {
         $pad = 20
+        $cap = 32
         $card.Left = $pad
-        $card.Top = $pad
+        $card.Top = $cap + $pad
         $card.Width = $form.ClientSize.Width - ($pad * 2)
         $textW = [Math]::Max(120, $card.Width - 32)
         $heading.Width = $textW
@@ -1717,12 +1962,6 @@ function Show-SteamPrompt {
     }.GetNewClosure()
 
     $form.Controls.Add($card)
-    $form.Add_Paint({
-            param($sender, $event)
-            $pen = New-Object System.Drawing.Pen $ui.CardHot, 1
-            $event.Graphics.DrawRectangle($pen, 0, 0, ($sender.ClientSize.Width - 1), ($sender.ClientSize.Height - 1))
-            $pen.Dispose()
-        }.GetNewClosure())
 
     $drag = @{ Active = $false; X = 0; Y = 0 }
     $startDrag = {
@@ -1758,6 +1997,7 @@ function Show-SteamPrompt {
     ).Height
     $label.Height = [Math]::Max(40, ($needed + 8))
     $card.Height = $label.Bottom + 16
+    $card.Top = 52
     $formSize = New-Object System.Drawing.Size
     $formSize.Width = $neededTextW + 72
     $formSize.Height = [int]($card.Bottom + 36 + 36 + 24)
@@ -1809,14 +2049,13 @@ function Show-SteamErrorDialog {
     }
 
     $ui = Get-UiTheme
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-Object SteamForm
     $form.Text = 'SteamDriveOrder error'
     $form.StartPosition = 'CenterScreen'
     $form.Size = New-Object System.Drawing.Size(860, 560)
     $form.MinimumSize = New-Object System.Drawing.Size(640, 400)
-    $form.BackColor = $ui.Bg
+    $form.SetCaptionButtons($true, $true)
     $form.ForeColor = $ui.Text
-    $form.ShowIcon = $false
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = 'Something went wrong'
@@ -2092,13 +2331,29 @@ function Set-CardChromeColor {
     }
 }
 
+function Set-LibraryList {
+    param($Items)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -ne $Items) {
+        foreach ($item in $Items) {
+            if ($null -ne $item) { $list.Add($item) }
+        }
+    }
+    $script:Libraries = $list
+}
+
 function Move-LibraryInList {
     param([int]$From, [int]$To)
     if ($From -eq $To -or $From -lt 0 -or $To -lt 0) { return }
-    if ($From -ge $script:Libraries.Count -or $To -ge $script:Libraries.Count) { return }
-    $item = $script:Libraries[$From]
-    $script:Libraries.RemoveAt($From)
-    $script:Libraries.Insert($To, $item)
+    $list = New-Object System.Collections.Generic.List[object]
+    if ($null -ne $script:Libraries) {
+        foreach ($item in $script:Libraries) { $list.Add($item) }
+    }
+    if ($From -ge $list.Count -or $To -ge $list.Count) { return }
+    $moved = $list[$From]
+    $list.RemoveAt($From)
+    $list.Insert($To, $moved)
+    $script:Libraries = $list
 }
 
 function Get-DriveAccent {
@@ -2523,14 +2778,13 @@ function Show-SteamDriveOrderWindow {
     $form = New-Object SteamForm
     $form.Text = 'SteamDriveOrder'
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(860, 680)
-    $form.MinimumSize = New-Object System.Drawing.Size(760, 560)
-    $form.BackColor = $script:Ui.Bg
+    $form.Size = New-Object System.Drawing.Size(860, 712)
+    $form.MinimumSize = New-Object System.Drawing.Size(760, 592)
+    $form.SetCaptionButtons($true, $true)
+    $form.SetCaptionOverlay($true)
     $form.ForeColor = $script:Ui.Text
     $form.Font = New-UiFont
-    $form.ShowIcon = $false
     Enable-DoubleBuffer -Control $form
-    Enable-DarkTitleBar -Form $form
 
     $warnBanner = New-UiLabel -Text 'Moving the C Drive is not recommended' -Size 9.5 -Style Bold -Fore $script:Ui.Text
     $warnBanner.Dock = 'Top'
@@ -2542,40 +2796,40 @@ function Show-SteamDriveOrderWindow {
 
     $header = New-Object System.Windows.Forms.Panel
     $header.Dock = 'Top'
-    $header.Height = 136
+    $header.Height = 118
     $header.BackColor = $script:Ui.Surface
 
-    $accentLine = New-Object System.Windows.Forms.Panel
-    $accentLine.Height = 2
-    $accentLine.Dock = 'Top'
-    $accentLine.BackColor = $script:Ui.Accent
-
-    $kicker = New-UiLabel -Text 'STORAGE' -Size 8 -Style Bold -Fore $script:Ui.Accent -Flush
-    $kicker.BackColor = $script:Ui.Surface
-
-    $title = New-UiLabel -Text 'Library Order' -Size 20 -Style Bold -Flush
+    $title = New-UiLabel -Text 'Drive Order' -Size 20 -Style Bold -Flush
     $title.BackColor = $script:Ui.Surface
 
     $hint = New-UiLabel -Text '' -Size 9.5 -Fore $script:Ui.Muted -Flush
     $hint.BackColor = $script:Ui.Surface
     $script:HintLabel = $hint
 
-    $pathLabel = New-UiLabel -Text ("Steam  ·  {0}" -f (Format-DisplayPath $script:SteamPath)) -Size 8.5 -Fore $script:Ui.Muted -Flush
+    $pathLabel = New-UiLabel -Text ("Steam  ·  {0}" -f (Format-DisplayPath $script:SteamPath)) -Size 8.5 -Style Bold -Fore $script:Ui.Accent -Flush
     $pathLabel.BackColor = $script:Ui.Surface
 
     $placeHeaderText = {
+        if ($header.ClientSize.Width -lt 80) { return }
         $left = Get-CardListGutter
-        $textW = [Math]::Max(160, $header.ClientSize.Width - $left - 28)
-        $kicker.SetBounds($left, 14, $textW, 20)
-        $title.SetBounds($left, 32, $textW, 42)
-        $hint.SetBounds($left, 74, $textW, 28)
-        $pathLabel.SetBounds($left, 102, $textW, 22)
+        $textW = [Math]::Max(160, $header.ClientSize.Width - $left - 150)
+        $title.SetBounds($left, 10, $textW, 42)
+        $hint.SetBounds($left, 54, $textW, 28)
+        $pathLabel.SetBounds($left, 84, $textW, 22)
     }
     $header.Add_Resize({ & $placeHeaderText }.GetNewClosure())
     & $placeHeaderText
 
-    $header.Controls.Add($accentLine)
-    $header.Controls.Add($kicker)
+    $dragWindow = {
+        param($sender, $event)
+        if ($event.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+            [SteamChrome]::DragWindow($form)
+        }
+    }.GetNewClosure()
+    $header.Add_MouseDown($dragWindow)
+    $title.Add_MouseDown($dragWindow)
+    $hint.Add_MouseDown($dragWindow)
+    $pathLabel.Add_MouseDown($dragWindow)
     $header.Controls.Add($title)
     $header.Controls.Add($hint)
     $header.Controls.Add($pathLabel)
@@ -2627,6 +2881,7 @@ function Show-SteamDriveOrderWindow {
         })
 
     $form.Add_Resize({
+            if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { return }
             if (-not $script:CardHost) { return }
             if ($script:Drag -and $script:Drag.Active) { return }
             if ($script:CardHost -is [SteamScrollView]) {
@@ -2654,7 +2909,7 @@ function Show-SteamDriveOrderWindow {
             Update-ApplyButton
             Start-ApplyIdleWatch
         })
-    [void]$form.ShowDialog()
+    [System.Windows.Forms.Application]::Run($form)
 }
 
 function Invoke-SteamDriveOrder {
@@ -2665,10 +2920,8 @@ function Invoke-SteamDriveOrder {
     Initialize-SteamDriveOrderUi
     $steam = Get-SteamInstallPath
     $state = Read-SteamLibraries -SteamPath $steam
-    $list = New-Object System.Collections.Generic.List[object]
-    foreach ($lib in $state.Libraries) { $list.Add($lib) }
     $script:Meta = $state.Meta
-    $script:Libraries = $list
+    Set-LibraryList $state.Libraries
     $script:SteamPath = $steam
     $script:Drag = New-CardDragState
     Show-SteamDriveOrderWindow
