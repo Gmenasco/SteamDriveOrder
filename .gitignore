@@ -1,4 +1,4 @@
-# Built release binary (upload dist\SteamDriveOrder.exe to GitHub Releases)
+# Leftover local build folder. The shippable exe is SteamDriveOrder.exe at the repo root.
 dist/
 
 # Local backups created by the app (also written under %LOCALAPPDATA%)

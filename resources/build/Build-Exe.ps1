@@ -1,5 +1,5 @@
 # Builds the shippable WinForms executable with ps2exe (no extra runtime).
-# Output: dist\SteamDriveOrder.exe
+# Output: SteamDriveOrder.exe in the repo root.
 
 [CmdletBinding()]
 param(
@@ -9,10 +9,11 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$root = Split-Path -Parent $PSScriptRoot
-$dist = Join-Path $root 'dist'
-$icon = Join-Path $root 'assets\app.ico'
-$source = Join-Path $root 'SteamDriveOrder.ps1'
+$resources = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent $resources
+$icon = Join-Path $resources 'assets\app.ico'
+$source = Join-Path $resources 'SteamDriveOrder.ps1'
+$output = Join-Path $root 'SteamDriveOrder.exe'
 
 if (-not (Get-Command Invoke-ps2exe -ErrorAction SilentlyContinue)) {
     Import-Module ps2exe -ErrorAction Stop
@@ -82,10 +83,8 @@ if (-not (Test-Path -LiteralPath $icon)) {
     New-AppIcon -Path $icon
 }
 
-New-Item -ItemType Directory -Path $dist -Force | Out-Null
-
 Write-Host 'Building SteamDriveOrder.exe...'
-Invoke-ps2exe -inputFile $source -outputFile (Join-Path $dist 'SteamDriveOrder.exe') `
+Invoke-ps2exe -inputFile $source -outputFile $output `
     -iconFile $icon `
     -noConsole `
     -STA `
@@ -100,7 +99,7 @@ Invoke-ps2exe -inputFile $source -outputFile (Join-Path $dist 'SteamDriveOrder.e
     -copyright 'MIT' `
     -version $Version
 
-Get-ChildItem $dist -Filter 'SteamDriveOrder.exe' | ForEach-Object {
+Get-Item $output | ForEach-Object {
     Write-Host ("{0}  {1:N1} KB" -f $_.Name, ($_.Length / 1KB))
 }
 Write-Host 'Done.'

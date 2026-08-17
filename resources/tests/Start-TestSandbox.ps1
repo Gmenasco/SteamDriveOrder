@@ -2,7 +2,8 @@
 # Safe on the host: the guest cannot write to the project, only to .sandbox-out.
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$resources = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent $resources
 $wsb = Join-Path $PSScriptRoot 'SteamDriveOrder.Sandbox.wsb'
 $outDir = Join-Path $root '.sandbox-out'
 $sandbox = Join-Path $env:WINDIR 'System32\WindowsSandbox.exe'

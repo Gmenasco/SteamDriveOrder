@@ -1,5 +1,7 @@
 # SteamDriveOrder
 
+**The app is `SteamDriveOrder.exe` in this folder.** Everything else is source and extras.
+
 **v1.0** — a small Windows tool that puts Steam's **Install to** / **Storage** drive list in the order you want.
 
 Steam does not expose a reorder control. It remembers libraries in the order they were added, and it keeps that list in **two** files. Edit only one of them — or edit while Steam is still running — and the old order comes back.
@@ -28,9 +30,9 @@ If you empty the steamapps copy and leave the config copy alone, Steam writes th
 
 ## Run it
 
-Windows 10/11, with the Steam desktop client installed. No extra runtime.
+**SteamDriveOrder.exe** is in this folder. Unzip and double-click it.
 
-Download `SteamDriveOrder.exe` from [GitHub Releases](https://github.com/Gmenasco/SteamDriveOrder/releases) or [Patreon](https://www.patreon.com/GarrettsProjects).
+Windows 10/11, with the Steam desktop client installed. No extra runtime. You can also get the same exe from [GitHub Releases](https://github.com/Gmenasco/SteamDriveOrder/releases) or [Patreon](https://www.patreon.com/GarrettsProjects).
 
 Windows may warn that the app is unsigned. That is expected for a small open-source tool. Choose **More info** → **Run anyway** if SmartScreen appears.
 
@@ -40,18 +42,18 @@ Windows may warn that the app is unsigned. That is expected for a small open-sou
 
 Backups land in `%LOCALAPPDATA%\SteamDriveOrder\backups\`.
 
-From source:
+From source (under `resources\`):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\SteamDriveOrder.ps1
+powershell -ExecutionPolicy Bypass -File .\resources\SteamDriveOrder.ps1
 ```
 
-Or double-click `SteamDriveOrder.bat`.
+Or double-click `resources\SteamDriveOrder.bat`.
 
 Command line, no window:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\SteamDriveOrder.ps1 -SortDriveLetters -KeepClientFirst -Apply
+powershell -ExecutionPolicy Bypass -File .\resources\SteamDriveOrder.ps1 -SortDriveLetters -KeepClientFirst -Apply
 ```
 
 ## Bugs
@@ -61,17 +63,17 @@ Open a [GitHub Issue](https://github.com/Gmenasco/SteamDriveOrder/issues). Inclu
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tests\Vdf.Tests.ps1
+powershell -ExecutionPolicy Bypass -File .\resources\tests\Vdf.Tests.ps1
 ```
 
 Rebuild the executable (needs the `ps2exe` module once):
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-powershell -ExecutionPolicy Bypass -File .\build\Build-Exe.ps1
+powershell -ExecutionPolicy Bypass -File .\resources\build\Build-Exe.ps1
 ```
 
-The built file is `dist\SteamDriveOrder.exe`.
+The built file is `SteamDriveOrder.exe` in this folder.
 
 ## Tips
 
